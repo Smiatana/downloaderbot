@@ -1,0 +1,6 @@
+{
+  "name": "StreamBot",
+  "description": "Zero-disk-storage async multipurpose media downloader Telegram bot and live streaming extractor for Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, and YouTube Shorts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
