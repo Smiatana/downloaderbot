@@ -11,6 +11,7 @@ import {
 import {
   buildAssetsFromTikWmData,
   buildAssetsFromYtDlpPayload,
+  getTermuxYtDlpPath,
   getYtDlpReleaseUrl,
   parseTikTokHtmlPayload,
   pickBestAudioFormat,
@@ -91,6 +92,14 @@ test('Extractor: selects a yt-dlp release matching x86_64 and ARM64', () => {
     'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64'
   );
   assert.throws(() => getYtDlpReleaseUrl('arm'), /not available for CPU architecture/);
+});
+
+test('Extractor: uses the Termux yt-dlp package path only in Termux', () => {
+  assert.equal(getTermuxYtDlpPath('/data/data/com.termux/files/usr'),
+    '/data/data/com.termux/files/usr/bin/yt-dlp');
+  assert.equal(getTermuxYtDlpPath(undefined, '0.118.0'),
+    '/data/data/com.termux/files/usr/bin/yt-dlp');
+  assert.equal(getTermuxYtDlpPath('/usr'), undefined);
 });
 
 test('URL Router: strips tracking params and preserves v/list/t on YouTube family', () => {

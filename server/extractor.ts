@@ -39,6 +39,15 @@ export function getYtDlpReleaseUrl(arch: string): string {
   return `${YTDLP_RELEASE_BASE_URL}/${asset}`;
 }
 
+export function getTermuxYtDlpPath(
+  prefix?: string,
+  termuxVersion?: string
+): string | undefined {
+  const isTermux = Boolean(termuxVersion) || Boolean(prefix?.includes('/com.termux/'));
+  if (!isTermux) return undefined;
+  return path.join(prefix || '/data/data/com.termux/files/usr', 'bin', 'yt-dlp');
+}
+
 function hasExpectedElfArchitecture(filePath: string): boolean {
   const expectedMachine = process.arch === 'x64'
     ? 62
@@ -96,6 +105,24 @@ function isValidExecutableYtDlp(filePath: string): boolean {
 }
 
 export async function ensureYtDlpBinary(): Promise<string> {
+  const termuxYtDlpPath = getTermuxYtDlpPath(
+    process.env.PREFIX,
+    process.env.TERMUX_VERSION
+  );
+  if (termuxYtDlpPath) {
+    try {
+      await execFileAsync(termuxYtDlpPath, ['--version'], {
+        shell: false,
+        timeout: 10_000,
+      });
+      return termuxYtDlpPath;
+    } catch {
+      throw new Error(
+        'Termux detected, but its yt-dlp command is unavailable. Install it with: pkg install python-yt-dlp yt-dlp-ejs'
+      );
+    }
+  }
+
   if (isValidExecutableYtDlp(YTDLP_PATH)) {
     return YTDLP_PATH;
   }

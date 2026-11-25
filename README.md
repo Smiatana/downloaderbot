@@ -75,6 +75,22 @@ npm run dev
 Open [http://localhost:3000](http://localhost:3000). Select **Telegram Bot**
 and sign in with `ADMIN_USERNAME` and `ADMIN_PASSWORD` to manage the bot.
 
+### Run in Termux on Android
+
+Termux uses Android's Bionic libc, so the standalone Linux yt-dlp ELF binary is
+not compatible even on an `aarch64` phone. Install the Termux-native Python
+package and its YouTube JavaScript support instead:
+
+```bash
+pkg update
+pkg install nodejs-lts python-yt-dlp yt-dlp-ejs ffmpeg
+npm ci
+npm run dev
+```
+
+The app detects Termux and runs `$PREFIX/bin/yt-dlp` directly. Do not copy the
+`yt-dlp_linux_aarch64` glibc binary into `bin/` on Android.
+
 For a production-mode local run:
 
 ```bash
