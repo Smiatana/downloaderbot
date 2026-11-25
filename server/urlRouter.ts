@@ -19,6 +19,10 @@ const PLATFORM_DOMAIN_RULES: Array<{
   match: (hostname: string, pathname: string) => boolean;
 }> = [
   {
+    platform: 'youtube_music',
+    match: (host) => host === 'music.youtube.com',
+  },
+  {
     platform: 'youtube_shorts',
     match: (host, path) =>
       (host === 'youtube.com' || host.endsWith('.youtube.com')) &&
@@ -119,16 +123,21 @@ export function sanitizeAndParseUrl(rawInput: string): ParsedMediaUrl | null {
     'igsh',
     'igshid',
     'fbclid',
+    'si',
     's',
     't',
   ];
   const cleanUrlObj = new URL(parsed.toString());
-  if (rule.platform !== 'youtube') {
+  const isYouTubeFamily =
+    rule.platform === 'youtube' ||
+    rule.platform === 'youtube_shorts' ||
+    rule.platform === 'youtube_music';
+  if (!isYouTubeFamily) {
     for (const key of trackingParams) {
       cleanUrlObj.searchParams.delete(key);
     }
   } else {
-    // Preserve 'v' and 'list' on YouTube, strip tracking params except 't'
+    // Preserve 'v', 'list', and 't' on YouTube platforms, strip tracking params
     for (const key of trackingParams) {
       if (key !== 't') cleanUrlObj.searchParams.delete(key);
     }

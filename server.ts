@@ -19,6 +19,44 @@ const ADMIN_USERNAME = process.env.ADMIN_USERNAME?.trim() || '';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const ADMIN_SESSION_COOKIE = 'streambot_admin';
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+const MAX_ASSET_CACHE_ENTRIES = 1000;
+
+function readBoundedInt(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.floor(parsed))) : fallback;
+}
+
+function createRateLimiter(maxRequests: number, windowMs: number): express.RequestHandler {
+  const clients = new Map<string, { count: number; resetAt: number }>();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of clients) {
+      if (entry.resetAt <= now) clients.delete(ip);
+    }
+  }, windowMs).unref();
+
+  return (req, res, next) => {
+    const now = Date.now();
+    const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+    let entry = clients.get(ip);
+    if (!entry || entry.resetAt <= now) {
+      if (clients.size >= 10_000) {
+        const oldestIp = clients.keys().next().value;
+        if (oldestIp) clients.delete(oldestIp);
+      }
+      entry = { count: 0, resetAt: now + windowMs };
+      clients.set(ip, entry);
+    }
+
+    entry.count += 1;
+    if (entry.count > maxRequests) {
+      res.setHeader('Retry-After', String(Math.ceil((entry.resetAt - now) / 1000)));
+      res.status(429).json({ error: 'Too many requests. Try again later.' });
+      return;
+    }
+    next();
+  };
+}
 
 // Ephemeral in-memory asset descriptor cache (20 min TTL, zero disk writes)
 const assetCache = new Map<string, { asset: MediaAsset; expiresAt: number }>();
@@ -34,7 +72,26 @@ setInterval(() => {
 
 async function bootstrap() {
   const app = express();
+  const trustedProxyHops = readBoundedInt('TRUST_PROXY_HOPS', 0, 0, 5);
+  if (trustedProxyHops > 0) app.set('trust proxy', trustedProxyHops);
+  app.disable('x-powered-by');
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    next();
+  });
+  app.use('/api', createRateLimiter(180, 60_000));
+  app.use('/api/extract', createRateLimiter(12, 60_000));
+  app.use('/api/stream', createRateLimiter(60, 60_000));
+  app.use('/api/events', createRateLimiter(6, 60_000));
   app.use(express.json({ limit: '1mb' }));
+
+  let activeExtractions = 0;
+  let activeStreams = 0;
+  const maxExtractions = readBoundedInt('MAX_EXTRACT_CONCURRENCY', 3, 1, 16);
+  const maxStreams = readBoundedInt('MAX_STREAM_CONCURRENCY', 6, 1, 32);
 
   const adminSessions = new Map<string, number>();
   const loginAttempts = new Map<string, { attempts: number; resetAt: number }>();
@@ -226,7 +283,7 @@ async function bootstrap() {
       res.write(': keepalive\n\n');
     }, 20_000);
 
-    req.on('close', () => {
+    res.on('close', () => {
       clearInterval(heartbeat);
       telemetry.off('snapshot', onSnapshot);
       telemetry.off('log', onLog);
@@ -241,7 +298,7 @@ async function bootstrap() {
     if (!parsedUrl) {
       res.status(400).json({
         error:
-          'Unsupported or unsafe URL. Provide a valid Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, or YouTube Shorts link.',
+          'Unsupported or unsafe URL. Provide a valid Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, YouTube Shorts, or YouTube Music link.',
       });
       return;
     }
@@ -253,6 +310,12 @@ async function bootstrap() {
         ? req.body.youtubeQuality
         : '720';
 
+    if (activeExtractions >= maxExtractions) {
+      res.setHeader('Retry-After', '10');
+      res.status(503).json({ error: 'Extraction capacity is busy. Try again shortly.' });
+      return;
+    }
+    activeExtractions += 1;
     telemetry.incrementActiveWorkers();
     try {
       const result = await extractMedia(parsedUrl, {
@@ -267,6 +330,10 @@ async function bootstrap() {
 
       const expiresAt = Date.now() + 20 * 60 * 1000;
       for (const asset of result.assets) {
+        if (assetCache.size >= MAX_ASSET_CACHE_ENTRIES) {
+          const oldestAssetId = assetCache.keys().next().value;
+          if (oldestAssetId) assetCache.delete(oldestAssetId);
+        }
         assetCache.set(asset.id, { asset, expiresAt });
       }
 
@@ -294,6 +361,7 @@ async function bootstrap() {
         details: message,
       });
     } finally {
+      activeExtractions = Math.max(0, activeExtractions - 1);
       telemetry.decrementActiveWorkers();
     }
   });
@@ -305,6 +373,12 @@ async function bootstrap() {
       return;
     }
 
+    if (activeStreams >= maxStreams) {
+      res.setHeader('Retry-After', '10');
+      res.status(503).json({ error: 'Stream capacity is busy. Try again shortly.' });
+      return;
+    }
+    activeStreams += 1;
     const forceExtractMp3 = req.query.mp3 === '1';
     const compressOverLimit = req.query.compress === '1';
     const asAttachment = req.query.download === '1';
@@ -315,6 +389,7 @@ async function bootstrap() {
     const releaseWorker = () => {
       if (!workerReleased) {
         workerReleased = true;
+        activeStreams = Math.max(0, activeStreams - 1);
         telemetry.decrementActiveWorkers();
       }
     };
@@ -337,7 +412,7 @@ async function bootstrap() {
         res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
       }
 
-      req.on('close', () => {
+      res.on('close', () => {
         cleanupFn?.();
         releaseWorker();
       });
@@ -382,6 +457,7 @@ async function bootstrap() {
           ? req.body.concurrency
           : undefined,
       youtubeQuality: req.body?.youtubeQuality,
+      mediaMode: req.body?.mediaMode,
       autoCompressOverLimit: req.body?.autoCompressOverLimit,
       proxyUrl: req.body?.proxyUrl,
       cookiesHeader: req.body?.cookiesHeader,
@@ -399,6 +475,7 @@ async function bootstrap() {
             ? req.body.concurrency
             : undefined,
         youtubeQuality: req.body?.youtubeQuality,
+        mediaMode: req.body?.mediaMode,
         autoCompressOverLimit: req.body?.autoCompressOverLimit,
         proxyUrl: req.body?.proxyUrl,
         cookiesHeader: req.body?.cookiesHeader,
@@ -454,9 +531,13 @@ async function bootstrap() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`StreamBot server listening on http://0.0.0.0:${PORT}`);
   });
+  server.headersTimeout = 15_000;
+  server.requestTimeout = 30_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxRequestsPerSocket = 100;
 }
 
 bootstrap().catch((err) => {

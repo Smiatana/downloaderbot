@@ -14,17 +14,17 @@ const PLATFORM_SPECS: PlatformSpec[] = [
     platform: 'Instagram',
     domains: 'instagram.com, instagr.am',
     content: 'Posts, Reels, Stories, Carousels',
-    streamPipeline: 'yt-dlp metadata + pooled HTTP Readable stream',
+    streamPipeline: 'yt-dlp metadata + HTTP Readable stream + FFmpeg MP3 pipe',
     specialBehavior:
-      'Multi-item carousels stream into Telegram sendMediaGroup (batches of 10) with sequential fallback.',
+      'Multi-item carousels stream into Telegram sendMediaGroup (batches of 10); videos also extract sound as MP3 music.',
   },
   {
     platform: 'TikTok',
     domains: 'tiktok.com, vm.tiktok.com, vt.tiktok.com',
     content: 'Videos, Photo Slideshows',
-    streamPipeline: 'HTTP video/photo stream + FFmpeg pipe:0 -> pipe:1 MP3',
+    streamPipeline: 'Fast TikWM / Direct HTML + zero-copy MP3 or FFmpeg MP3 pipe',
     specialBehavior:
-      'Extracts audio track on the fly to .mp3 and sends it via sendAudio alongside the video.',
+      'Streams HD video and MP3 audio concurrently with zero-transcode pass-through when MP3 is provided directly.',
   },
   {
     platform: 'Twitter / X',
@@ -53,18 +53,26 @@ const PLATFORM_SPECS: PlatformSpec[] = [
   {
     platform: 'YouTube',
     domains: 'youtube.com, youtu.be',
-    content: 'Long-form Videos (360p / 720p / 1080p)',
-    streamPipeline: 'Progressive MP4 stream or FFmpeg 1080p DASH mux pipe',
+    content: 'Long-form Videos (360p / 720p / 1080p) + MP3 Audio',
+    streamPipeline: 'Progressive/DASH MP4 stream + audio-only FFmpeg MP3 pipe',
     specialBehavior:
-      'Updates progress status message while resolving; checks 50 MB / 2 GB limit before streaming.',
+      'Streams video and extracts video sound as MP3 music; checks 50 MB / 2 GB limit before streaming.',
   },
   {
     platform: 'YouTube Shorts',
     domains: 'youtube.com/shorts/*',
-    content: 'Vertical Videos',
-    streamPipeline: 'High-compatibility H.264 MP4 stream',
+    content: 'Vertical Videos + MP3 Audio',
+    streamPipeline: 'H.264 MP4 stream + audio-only FFmpeg MP3 pipe',
     specialBehavior:
-      'Preserves vertical aspect dimensions and supports_streaming=true inline playback.',
+      'Preserves vertical aspect dimensions and also extracts the video sound as MP3 music.',
+  },
+  {
+    platform: 'YouTube Music',
+    domains: 'music.youtube.com',
+    content: 'Songs, Tracks, Playlists / Albums',
+    streamPipeline: 'Best audio-only stream -> FFmpeg MP3 pipe with ID3 tags',
+    specialBehavior:
+      'Resolves track/artist metadata and streams MP3 music directly via sendAudio.',
   },
 ];
 
@@ -87,14 +95,17 @@ function clientPreviewRoute(text: string) {
       ) {
         return { raw: cleaned, valid: false, reason: 'Blocked private/loopback IP' };
       }
+      if (host === 'music.youtube.com') {
+        return { raw: cleaned, valid: true, platform: 'YouTube Music (MP3)' };
+      }
       if ((host === 'youtube.com' || host.endsWith('.youtube.com')) && u.pathname.startsWith('/shorts/')) {
-        return { raw: cleaned, valid: true, platform: 'YouTube Shorts' };
+        return { raw: cleaned, valid: true, platform: 'YouTube Shorts (+ MP3)' };
       }
       if (host === 'youtube.com' || host === 'youtu.be' || host.endsWith('.youtube.com')) {
-        return { raw: cleaned, valid: true, platform: 'YouTube' };
+        return { raw: cleaned, valid: true, platform: 'YouTube (+ MP3)' };
       }
-      if (host === 'instagram.com' || host === 'instagr.am' || host.endsWith('.instagram.com')) {
-        return { raw: cleaned, valid: true, platform: 'Instagram' };
+      if (host === 'instagram.com' || host.endsWith('.instagram.com') || host === 'instagr.am' || host.endsWith('.instagr.am')) {
+        return { raw: cleaned, valid: true, platform: 'Instagram (+ MP3 for video)' };
       }
       if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) {
         return { raw: cleaned, valid: true, platform: 'TikTok (+ MP3)' };
@@ -130,7 +141,7 @@ export function PlatformMatrixView() {
             Supported Platform Matrix & Zero-Disk Pipelines
           </h2>
           <p className="text-sm text-slate-600 mt-1">
-            All seven target platforms execute inside an async worker semaphore with zero temporary files written to disk.
+            All eight target platforms execute inside an async worker semaphore with zero temporary files written to disk.
           </p>
         </div>
 

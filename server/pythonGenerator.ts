@@ -79,6 +79,7 @@ Platform = Literal[
     "tumblr",
     "youtube",
     "youtube_shorts",
+    "youtube_music",
 ]
 
 URL_REGEX = re.compile(r"https?://[^\\s<>\\\"'\\)\\]]+", re.IGNORECASE)
@@ -105,6 +106,8 @@ def detect_platform(raw_url: str) -> ParsedUrl | None:
     if PRIVATE_HOST_RE.match(host) or host.endswith((".local", ".internal")):
         return None
 
+    if host == "music.youtube.com":
+        return ParsedUrl("youtube_music", raw_url)
     if (host == "youtube.com" or host.endswith(".youtube.com")) and parsed.path.startswith("/shorts/"):
         return ParsedUrl("youtube_shorts", raw_url)
     if host in ("youtube.com", "youtu.be") or host.endswith(".youtube.com"):
@@ -213,28 +216,39 @@ class SubprocessPipeInputFile(InputFile):
                 await proc.wait()
 
 
-def build_ffmpeg_mp3_pipe_cmd(source_url: str) -> list[str]:
-    """Extracts TikTok audio on-the-fly directly to MP3 stdout (zero disk storage)."""
-    return [
+def build_ffmpeg_mp3_pipe_cmd(source_url: str, title: str | None = None, artist: str | None = None) -> list[str]:
+    """Extracts audio on-the-fly directly to MP3 stdout (zero disk storage)."""
+    cmd = [
         "ffmpeg",
         "-loglevel",
         "error",
+        "-fflags",
+        "+flush_packets",
         "-user_agent",
         DEFAULT_HEADERS["User-Agent"],
         "-i",
         source_url,
         "-vn",
-        "-acodec",
+        "-sn",
+        "-dn",
+        "-c:a",
         "libmp3lame",
         "-q:a",
+        "3",
+        "-compression_level",
         "2",
-        "-f",
-        "mp3",
-        "pipe:1",
+        "-id3v2_version",
+        "3",
     ]
+    if title:
+        cmd.extend(["-metadata", f"title={title}"])
+    if artist:
+        cmd.extend(["-metadata", f"artist={artist}"])
+    cmd.extend(["-f", "mp3", "pipe:1"])
+    return cmd
 
 
-def build_ffmpeg_dash_mux_cmd(video_url: str, audio_url: str) -> list[str]:
+def build_ffmpeg_dash_mux_cmd(video_url: str, audio_url: str, audio_copy: bool = True) -> list[str]:
     """Muxes Reddit/YouTube separate DASH video+audio into fragmented MP4 stdout."""
     return [
         "ffmpeg",
@@ -250,10 +264,7 @@ def build_ffmpeg_dash_mux_cmd(video_url: str, audio_url: str) -> list[str]:
         audio_url,
         "-c:v",
         "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
+        *(["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", "128k"]),
         "-f",
         "mp4",
         "-movflags",
@@ -298,12 +309,15 @@ def _sanitize_name(title: str, ext: str) -> str:
 
 
 def _extract_sync(parsed: ParsedUrl, yt_quality: int) -> list[ExtractedAsset]:
+    is_ytm_playlist = parsed.platform == "youtube_music" and "/playlist" in parsed.url
     ydl_opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "noplaylist": parsed.platform in ("youtube", "youtube_shorts"),
+        "noplaylist": parsed.platform in ("youtube", "youtube_shorts") or (parsed.platform == "youtube_music" and not is_ytm_playlist),
     }
+    if is_ytm_playlist:
+        ydl_opts["playlistend"] = 20
     if settings.proxy_url:
         ydl_opts["proxy"] = settings.proxy_url
     if settings.cookies_header:
@@ -318,11 +332,44 @@ def _extract_sync(parsed: ParsedUrl, yt_quality: int) -> list[ExtractedAsset]:
     for idx, entry in enumerate(entries or []):
         if not entry:
             continue
-        title = entry.get("title") or f"{parsed.platform}_media"
-        author = entry.get("uploader") or entry.get("channel")
+        title = entry.get("track") or entry.get("title") or f"{parsed.platform}_media"
+        raw_author = entry.get("artist") or entry.get("uploader") or entry.get("channel")
+        author = raw_author.removesuffix(" - Topic").strip() if raw_author else None
         formats = entry.get("formats") or []
         ext = (entry.get("ext") or "mp4").lower()
         suffix = f"_{idx + 1}" if len(entries) > 1 else ""
+
+        a_only = sorted(
+            [
+                f
+                for f in formats
+                if f.get("url")
+                and f.get("acodec") != "none"
+                and (not f.get("vcodec") or f.get("vcodec") == "none")
+                and "m3u8" not in (f.get("protocol") or "")
+            ],
+            key=lambda f: f.get("abr") or f.get("tbr") or 0,
+            reverse=True,
+        )
+
+        if parsed.platform == "youtube_music":
+            a_pick = a_only[0] if a_only else None
+            stream_url = (a_pick or {}).get("url") or entry.get("url")
+            if stream_url:
+                assets.append(
+                    ExtractedAsset(
+                        kind="audio",
+                        stream_url=stream_url,
+                        filename=_sanitize_name(f"{author} - {title}{suffix}" if author else f"{title}{suffix}", "mp3"),
+                        title=title,
+                        author=author,
+                        duration=entry.get("duration"),
+                        filesize=(a_pick or {}).get("filesize") or (a_pick or {}).get("filesize_approx"),
+                        headers=(a_pick or {}).get("http_headers") or entry.get("http_headers"),
+                        strategy="http" if (a_pick or {}).get("ext") == "mp3" else "ffmpeg_mp3",
+                    )
+                )
+            continue
 
         if ext in ("jpg", "jpeg", "png", "webp") and entry.get("url"):
             assets.append(
@@ -358,7 +405,9 @@ def _extract_sync(parsed: ParsedUrl, yt_quality: int) -> list[ExtractedAsset]:
             progressive[0] if progressive else None
         )
 
+        added_video_url: str | None = None
         if chosen:
+            added_video_url = chosen["url"]
             assets.append(
                 ExtractedAsset(
                     kind="animation" if ext == "gif" else "video",
@@ -373,79 +422,67 @@ def _extract_sync(parsed: ParsedUrl, yt_quality: int) -> list[ExtractedAsset]:
                     headers=chosen.get("http_headers") or entry.get("http_headers"),
                 )
             )
-            continue
-
-        # Separate DASH video + audio (Reddit / YouTube 1080p)
-        v_only = sorted(
-            [
-                f
-                for f in formats
-                if f.get("url")
-                and f.get("vcodec") != "none"
-                and (not f.get("acodec") or f.get("acodec") == "none")
-                and "m3u8" not in (f.get("protocol") or "")
-            ],
-            key=lambda f: f.get("height") or 0,
-            reverse=True,
-        )
-        a_only = sorted(
-            [
-                f
-                for f in formats
-                if f.get("url")
-                and f.get("acodec") != "none"
-                and (not f.get("vcodec") or f.get("vcodec") == "none")
-                and "m3u8" not in (f.get("protocol") or "")
-            ],
-            key=lambda f: f.get("tbr") or 0,
-            reverse=True,
-        )
-
-        if v_only and a_only:
-            v_pick = next((f for f in v_only if (f.get("height") or 0) <= yt_quality), v_only[0])
-            a_pick = a_only[0]
-            assets.append(
-                ExtractedAsset(
-                    kind="video",
-                    stream_url=v_pick["url"],
-                    audio_url=a_pick["url"],
-                    filename=_sanitize_name(f"{title}{suffix}", "mp4"),
-                    title=title,
-                    author=author,
-                    width=v_pick.get("width"),
-                    height=v_pick.get("height"),
-                    duration=entry.get("duration"),
-                    strategy="ffmpeg_dash",
-                )
-            )
-        elif entry.get("url"):
-            assets.append(
-                ExtractedAsset(
-                    kind="video",
-                    stream_url=entry["url"],
-                    filename=_sanitize_name(f"{title}{suffix}", "mp4"),
-                    title=title,
-                    author=author,
-                    duration=entry.get("duration"),
-                    headers=entry.get("http_headers"),
-                )
+        else:
+            # Separate DASH video + audio (Reddit / YouTube 1080p)
+            v_only = sorted(
+                [
+                    f
+                    for f in formats
+                    if f.get("url")
+                    and f.get("vcodec") != "none"
+                    and (not f.get("acodec") or f.get("acodec") == "none")
+                    and "m3u8" not in (f.get("protocol") or "")
+                ],
+                key=lambda f: f.get("height") or 0,
+                reverse=True,
             )
 
-    # TikTok requirement: append zero-disk MP3 audio extraction asset
-    if parsed.platform == "tiktok":
-        video_asset = next((a for a in assets if a.kind == "video"), None)
-        if video_asset:
-            assets.append(
-                ExtractedAsset(
-                    kind="audio",
-                    stream_url=video_asset.stream_url,
-                    filename=_sanitize_name(f"{video_asset.title}_audio", "mp3"),
-                    title=f"{video_asset.title} (Audio)",
-                    author=video_asset.author,
-                    duration=video_asset.duration,
-                    strategy="ffmpeg_mp3",
+            if v_only and a_only:
+                v_pick = next((f for f in v_only if (f.get("height") or 0) <= yt_quality), v_only[0])
+                a_pick = next((f for f in a_only if f.get("ext") == "m4a"), a_only[0])
+                added_video_url = a_pick["url"]
+                assets.append(
+                    ExtractedAsset(
+                        kind="video",
+                        stream_url=v_pick["url"],
+                        audio_url=a_pick["url"],
+                        filename=_sanitize_name(f"{title}{suffix}", "mp4"),
+                        title=title,
+                        author=author,
+                        width=v_pick.get("width"),
+                        height=v_pick.get("height"),
+                        duration=entry.get("duration"),
+                        strategy="ffmpeg_dash",
+                    )
                 )
-            )
+            elif entry.get("url"):
+                added_video_url = entry["url"]
+                assets.append(
+                    ExtractedAsset(
+                        kind="video",
+                        stream_url=entry["url"],
+                        filename=_sanitize_name(f"{title}{suffix}", "mp4"),
+                        title=title,
+                        author=author,
+                        duration=entry.get("duration"),
+                        headers=entry.get("http_headers"),
+                    )
+                )
+
+        if parsed.platform in ("tiktok", "youtube", "youtube_shorts", "instagram") and (added_video_url or parsed.platform == "tiktok"):
+            audio_src = (a_only[0]["url"] if a_only else None) or added_video_url
+            if audio_src:
+                assets.append(
+                    ExtractedAsset(
+                        kind="audio",
+                        stream_url=audio_src,
+                        filename=_sanitize_name(f"{title}{suffix}_audio", "mp3"),
+                        title=f"{title} (Audio)",
+                        author=author,
+                        duration=entry.get("duration"),
+                        strategy="ffmpeg_mp3",
+                    )
+                )
 
     return assets
 
@@ -489,12 +526,12 @@ def to_input_file(asset: ExtractedAsset):
     assert http_session is not None
     if asset.strategy == "ffmpeg_mp3":
         return SubprocessPipeInputFile(
-            build_ffmpeg_mp3_pipe_cmd(asset.stream_url),
+            build_ffmpeg_mp3_pipe_cmd(asset.stream_url, title=asset.title, artist=asset.author),
             filename=asset.filename,
         )
     if asset.strategy == "ffmpeg_dash" and asset.audio_url:
         return SubprocessPipeInputFile(
-            build_ffmpeg_dash_mux_cmd(asset.stream_url, asset.audio_url),
+            build_ffmpeg_dash_mux_cmd(asset.stream_url, asset.audio_url, audio_copy=".m4a" in asset.audio_url or "DASH_AUDIO" in asset.audio_url),
             filename=asset.filename,
         )
     return HttpStreamInputFile(
@@ -516,38 +553,41 @@ async def handle_url(message: Message, parsed: ParsedUrl) -> None:
             visuals = [a for a in assets if a.kind != "audio"]
             audios = [a for a in assets if a.kind == "audio"]
 
-            if len(visuals) > 1:
-                for i in range(0, len(visuals), 10):
-                    group = []
-                    for item in visuals[i : i + 10]:
+            async def send_visuals() -> None:
+                if len(visuals) > 1:
+                    for i in range(0, len(visuals), 10):
+                        group = []
+                        for item in visuals[i : i + 10]:
+                            media = to_input_file(item)
+                            if item.kind == "photo":
+                                group.append(InputMediaPhoto(media=media))
+                            else:
+                                group.append(InputMediaVideo(media=media, supports_streaming=True))
+                        await message.reply_media_group(group)
+                elif len(visuals) == 1:
+                    item = visuals[0]
+                    if item.filesize and item.filesize > settings.max_upload_bytes:
+                        await message.reply(
+                            f"⚠️ File exceeds Telegram upload limit. Direct stream:\\n{item.stream_url}"
+                        )
+                    else:
                         media = to_input_file(item)
                         if item.kind == "photo":
-                            group.append(InputMediaPhoto(media=media))
+                            await message.reply_photo(media)
+                        elif item.kind == "animation":
+                            await message.reply_animation(media)
                         else:
-                            group.append(InputMediaVideo(media=media, supports_streaming=True))
-                    await message.reply_media_group(group)
-            elif len(visuals) == 1:
-                item = visuals[0]
-                if item.filesize and item.filesize > settings.max_upload_bytes:
-                    await message.reply(
-                        f"⚠️ File exceeds Telegram upload limit. Direct stream:\\n{item.stream_url}"
-                    )
-                else:
-                    media = to_input_file(item)
-                    if item.kind == "photo":
-                        await message.reply_photo(media)
-                    elif item.kind == "animation":
-                        await message.reply_animation(media)
-                    else:
-                        await message.reply_video(media, supports_streaming=True)
+                            await message.reply_video(media, supports_streaming=True)
 
-            for audio in audios:
+            async def send_audio(audio: ExtractedAsset) -> None:
                 await message.bot.send_chat_action(message.chat.id, ChatAction.RECORD_VOICE)
                 await message.reply_audio(
                     to_input_file(audio),
                     title=audio.title,
                     performer=audio.author,
                 )
+
+            await asyncio.gather(send_visuals(), *(send_audio(a) for a in audios))
         except Exception as exc:
             logger.exception("Failed handling %s: %s", parsed.url, exc)
             await message.reply(
@@ -568,7 +608,7 @@ async def main() -> None:
     @dp.message(Command("start", "help"))
     async def cmd_start(message: Message) -> None:
         await message.reply(
-            "Send any link from Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, or YouTube Shorts.\\n"
+            "Send any link from Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, YouTube Shorts, or YouTube Music.\\n"
             "All media streams directly in memory with zero local disk storage."
         )
 

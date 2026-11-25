@@ -10,16 +10,20 @@ an exportable Python (aiogram v3) bot bundle.
 - Telegram bot that accepts media links in chats and streams the results to
   Telegram.
 - Browser-based stream tester for previewing and downloading extracted media.
-- Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, and YouTube Shorts
-  support. TikTok links also include extracted audio.
+- Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, YouTube Shorts, and
+  YouTube Music support. TikTok, YouTube, YouTube Shorts, and Instagram video
+  links also include extracted MP3 audio.
 - Telegram bot controls for the bot token, API endpoint, concurrency, YouTube
-  quality, compression, proxy, and cookie settings.
+  quality, video/music/both delivery mode, compression, proxy, and cookie settings.
 - Live telemetry, a platform matrix, and generated Python bot source.
 - Admin sign-in protecting the Telegram bot panel and all `/api/bot/*`
   endpoints.
 
-Media is processed with streaming and FFmpeg pipelines. The standalone yt-dlp
-binary is downloaded automatically if it is not already available.
+Media is processed with streaming and FFmpeg pipelines. Audio-only streams are
+sent in their source format when available; the service does not buffer whole
+media files in RAM. YouTube metadata extraction enables yt-dlp's Node.js
+JavaScript runtime. The standalone yt-dlp binary is downloaded automatically
+if it is not already available.
 
 ## Requirements
 
@@ -54,6 +58,9 @@ automatically. Keep `.env` private; do not commit credentials or tokens.
 | `TELEGRAM_BOT_TOKEN` | Only to run the bot | — | Token from @BotFather. If set, the server attempts to start the bot on launch. |
 | `TELEGRAM_API_ROOT` | No | `https://api.telegram.org` | Telegram Bot API endpoint. Use a self-hosted Bot API server for the larger upload limit. |
 | `BOT_CONCURRENCY` | No | `8` | Maximum number of concurrent bot media jobs (1–32). |
+| `MAX_EXTRACT_CONCURRENCY` | No | `3` | Maximum simultaneous web extraction jobs (1–16). |
+| `MAX_STREAM_CONCURRENCY` | No | `6` | Maximum simultaneous browser media streams (1–32). |
+| `TRUST_PROXY_HOPS` | No | `0` | Number of trusted reverse-proxy hops. Set only when deployed behind a proxy you control. |
 | `PORT` | No | `3000` | Host port for the web app. Docker Compose maps this host port to container port 3000. |
 
 ## Run locally
@@ -121,10 +128,13 @@ selected, and proxy/cookie values can be supplied for supported sources.
 
 Sign in to the **Telegram Bot** panel, enter a token (unless already set in the
 environment), and start the bot. Send a supported link to the bot in Telegram.
+Use **Media to Send from Every Source** to choose video, music, or both. The
+default is both, matching the prior behavior.
 The bot also supports:
 
 - `/start` — usage information.
 - `/help` — supported platforms and the active upload limit.
+- `/options` — toggle video and sound independently with inline checkboxes for this chat.
 - `/quality` — select a preferred YouTube quality (360p, 720p, or 1080p).
 
 ### Python source export
@@ -146,6 +156,15 @@ as a ZIP bundle.
 - Use HTTPS for any deployment beyond a trusted local network. If TLS
   terminates at a reverse proxy, configure it to forward the original HTTPS
   protocol.
+- Put public deployments behind a CDN/WAF or reverse proxy with connection,
+  body-size, and request-rate controls. The app adds per-IP API limits and
+  bounded worker queues, but in-process limits cannot stop volumetric DDoS or
+  coordinate limits across multiple replicas. When using a trusted proxy, set
+  `TRUST_PROXY_HOPS` to its exact hop count; do not trust arbitrary forwarded
+  headers.
+- Docker Compose caps the container at 768 MiB, 2 CPUs, and 128 processes, and
+  Node.js is limited to a 512 MiB heap. Adjust these together with media-job
+  concurrency for the host's available resources.
 - Keep admin credentials and the Telegram token out of source control and
   logs. Anyone with access to the bot panel can control the bot.
 

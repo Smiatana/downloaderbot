@@ -65,6 +65,7 @@ const INITIAL_BOT_STATUS: BotStatusSnapshot = {
   limitMb: 50,
   concurrency: 8,
   youtubeQuality: '720',
+  mediaMode: 'both',
   autoCompressOverLimit: false,
   hasToken: false,
   hasProxy: false,

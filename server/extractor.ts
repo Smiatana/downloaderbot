@@ -121,7 +121,7 @@ async function probeContentLength(
 ): Promise<number | undefined> {
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
+    const timer = setTimeout(() => controller.abort(), 2000);
     const res = await undiciFetch(url, {
       method: 'HEAD',
       headers: {
@@ -154,14 +154,18 @@ interface YtDlpFormat {
   filesize?: number;
   filesize_approx?: number;
   tbr?: number;
+  abr?: number;
   protocol?: string;
   cookies?: string;
   http_headers?: Record<string, string>;
 }
 
-interface YtDlpEntry {
+export interface YtDlpEntry {
   id?: string;
   title?: string;
+  track?: string;
+  artist?: string;
+  album?: string;
   uploader?: string;
   channel?: string;
   creator?: string;
@@ -226,7 +230,106 @@ function isProgressiveMp4(fmt: YtDlpFormat): boolean {
   );
 }
 
-function pickFormatsForEntry(
+const AUDIO_EXTRACTION_PLATFORMS = new Set<PlatformId>([
+  'tiktok',
+  'youtube',
+  'youtube_shorts',
+  'instagram',
+]);
+
+function cleanMusicAuthor(rawAuthor?: string): string | undefined {
+  if (!rawAuthor) return undefined;
+  const cleaned = rawAuthor.replace(/\s*-\s*Topic$/i, '').trim();
+  return cleaned || undefined;
+}
+
+export function pickBestAudioFormat(entry: YtDlpEntry): YtDlpFormat | undefined {
+  const formats = Array.isArray(entry.formats) ? entry.formats : [];
+  const audioOnly = formats
+    .filter(
+      (f) =>
+        Boolean(f.url) &&
+        f.acodec &&
+        f.acodec !== 'none' &&
+        (!f.vcodec || f.vcodec === 'none') &&
+        !f.protocol?.includes('m3u8')
+    )
+    .sort((a, b) => {
+      const aRate = a.abr ?? a.tbr ?? 0;
+      const bRate = b.abr ?? b.tbr ?? 0;
+      if (bRate !== aRate) return bRate - aRate;
+      const aM4a = a.ext === 'm4a' || a.ext === 'mp3' ? 1 : 0;
+      const bM4a = b.ext === 'm4a' || b.ext === 'mp3' ? 1 : 0;
+      return bM4a - aM4a;
+    });
+
+  if (audioOnly.length > 0) {
+    return audioOnly[0];
+  }
+
+  // Fallback to progressive format if no dedicated audio-only stream exists
+  return formats.find(
+    (f) =>
+      Boolean(f.url) &&
+      f.acodec &&
+      f.acodec !== 'none' &&
+      !f.protocol?.includes('m3u8')
+  );
+}
+
+function buildAudioAssetFromSource(params: {
+  title: string;
+  author?: string;
+  platform: PlatformId;
+  sourceUrl: string;
+  streamUrl: string;
+  thumbnailUrl?: string;
+  durationSeconds?: number;
+  estimatedBytes?: number;
+  limitBytes: number;
+  headers?: Record<string, string>;
+  sourceExt?: string;
+  strategy?: 'direct_http' | 'ffmpeg_extract_mp3';
+  filenameBase?: string;
+}): MediaAsset {
+  const est = params.estimatedBytes;
+  const sourceExt = params.sourceExt?.toLowerCase();
+  const ext = sourceExt && /^(mp3|m4a|aac|opus|webm|ogg|wav|flac)$/.test(sourceExt)
+    ? sourceExt
+    : 'mp3';
+  const preservesSource = Boolean(sourceExt && ext === sourceExt);
+  return {
+    id: randomUUID(),
+    kind: 'audio',
+    title: params.title,
+    author: params.author,
+    platform: params.platform,
+    sourceUrl: params.sourceUrl,
+    streamUrl: params.streamUrl,
+    thumbnailUrl: params.thumbnailUrl,
+    filename: sanitizeFilename(params.filenameBase ?? params.title, ext),
+    mimeType: ext === 'mp3'
+      ? 'audio/mpeg'
+      : ext === 'm4a' || ext === 'aac'
+        ? 'audio/mp4'
+        : ext === 'webm' || ext === 'opus'
+          ? 'audio/webm'
+          : ext === 'ogg'
+            ? 'audio/ogg'
+            : ext === 'wav'
+              ? 'audio/wav'
+              : 'audio/flac',
+          ext,
+    durationSeconds: params.durationSeconds,
+    estimatedBytes: est,
+    exceedsLimit: typeof est === 'number' && est > params.limitBytes,
+    limitBytes: params.limitBytes,
+    strategy: preservesSource ? 'direct_http' : params.strategy ?? 'ffmpeg_extract_mp3',
+    headers: params.headers,
+  };
+}
+
+export function pickFormatsForEntry(
   entry: YtDlpEntry,
   _platform: PlatformId,
   quality: YouTubeQuality,
@@ -234,6 +337,7 @@ function pickFormatsForEntry(
 ): {
   streamUrl: string;
   audioStreamUrl?: string;
+  audioExt?: string;
   ext: string;
   kind: MediaKind;
   strategy: 'direct_http' | 'ffmpeg_mux_dash';
@@ -353,13 +457,17 @@ function pickFormatsForEntry(
       return {
         streamUrl: vMatch.url,
         audioStreamUrl: aMatch.url,
+        audioExt: aMatch.ext,
         ext: 'mp4',
         kind: 'video',
         strategy: 'ffmpeg_mux_dash',
         width: vMatch.width ?? entry.width,
         height: vMatch.height ?? entry.height,
         estimatedBytes: vSize + aSize > 0 ? vSize + aSize : undefined,
-        headers: vMatch.http_headers ?? entry.http_headers,
+        headers: mergeCookieHeader(
+          vMatch.http_headers ?? entry.http_headers,
+          vMatch.cookies ?? entry.cookies
+        ),
         resolutionLabel: vMatch.height ? `${vMatch.height}p` : undefined,
       };
     }
@@ -382,7 +490,7 @@ function pickFormatsForEntry(
       width: entry.width,
       height: entry.height,
       estimatedBytes: entry.filesize ?? entry.filesize_approx,
-      headers: entry.http_headers,
+      headers: mergeCookieHeader(entry.http_headers, entry.cookies),
       resolutionLabel: entry.height ? `${entry.height}p` : undefined,
     };
   }
@@ -400,7 +508,10 @@ function pickFormatsForEntry(
       width: anyHttpVideo.width ?? entry.width,
       height: anyHttpVideo.height ?? entry.height,
       estimatedBytes: anyHttpVideo.filesize ?? anyHttpVideo.filesize_approx,
-      headers: anyHttpVideo.http_headers ?? entry.http_headers,
+      headers: mergeCookieHeader(
+        anyHttpVideo.http_headers ?? entry.http_headers,
+        anyHttpVideo.cookies ?? entry.cookies
+      ),
       resolutionLabel: anyHttpVideo.height ? `${anyHttpVideo.height}p` : undefined,
     };
   }
@@ -408,46 +519,18 @@ function pickFormatsForEntry(
   return null;
 }
 
-async function extractWithYtDlp(
+export async function buildAssetsFromYtDlpPayload(
+  payload: YtDlpEntry,
   parsedUrl: ParsedMediaUrl,
-  options: ExtractionOptions
-): Promise<ExtractionResult> {
-  const start = Date.now();
-  const maxLimitBytes = options.maxLimitBytes ?? DEFAULT_LIMIT_BYTES;
-  const quality = options.youtubeQuality ?? '720';
-  const ytDlpBin = await ensureYtDlpBinary();
-
-  const args = [
-    '--dump-single-json',
-    '--no-warnings',
-    '--no-check-certificates',
-    '--skip-download',
-    '--user-agent',
-    USER_AGENT,
-  ];
-
-  if (options.proxyUrl?.trim()) {
-    args.push('--proxy', options.proxyUrl.trim());
-  }
-  if (options.cookiesHeader?.trim()) {
-    args.push('--add-header', `Cookie:${options.cookiesHeader.trim()}`);
-  }
-  if (
-    parsedUrl.platform === 'youtube' ||
-    parsedUrl.platform === 'youtube_shorts'
-  ) {
-    args.push('--no-playlist');
-  }
-
-  args.push(parsedUrl.normalizedUrl);
-
-  const { stdout } = await execFileAsync(ytDlpBin, args, {
-    shell: false,
-    timeout: 28_000,
-    maxBuffer: 20 * 1024 * 1024,
-  });
-
-  const payload = JSON.parse(stdout) as YtDlpEntry;
+  quality: YouTubeQuality,
+  maxLimitBytes: number,
+  options: { skipHeadProbe?: boolean } = {}
+): Promise<{
+  title: string;
+  author?: string;
+  assets: MediaAsset[];
+  warnings: string[];
+}> {
   const entries =
     payload._type === 'playlist' && Array.isArray(payload.entries)
       ? payload.entries
@@ -455,13 +538,73 @@ async function extractWithYtDlp(
 
   const assets: MediaAsset[] = [];
   const warnings: string[] = [];
-  const title = payload.title || entries[0]?.title || `${parsedUrl.platform} media`;
-  const author =
-    payload.uploader ||
-    payload.channel ||
-    payload.creator ||
-    entries[0]?.uploader;
+  const title = payload.track || payload.title || entries[0]?.track || entries[0]?.title || `${parsedUrl.platform} media`;
+  const author = cleanMusicAuthor(
+    payload.artist ||
+      payload.uploader ||
+      payload.channel ||
+      payload.creator ||
+      entries[0]?.artist ||
+      entries[0]?.uploader
+  );
 
+  // YouTube Music: resolve pure audio MP3 track(s) with track/artist metadata
+  if (parsedUrl.platform === 'youtube_music') {
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      if (!entry) continue;
+      const audioFormat = pickBestAudioFormat(entry);
+      const streamUrl = audioFormat?.url ?? (entry.url && !entry.url.includes('.m3u8') ? entry.url : undefined);
+      if (!streamUrl) continue;
+
+      const trackTitle = entry.track || entry.title || title;
+      const trackAuthor = cleanMusicAuthor(
+        entry.artist || entry.creator || entry.uploader || entry.channel || author
+      );
+      const suffix = entries.length > 1 ? `_${i + 1}` : '';
+      const est = audioFormat?.filesize ?? audioFormat?.filesize_approx ?? entry.filesize ?? entry.filesize_approx;
+      const isDirectMp3 = audioFormat?.ext === 'mp3' || entry.ext === 'mp3';
+
+      assets.push(
+        buildAudioAssetFromSource({
+          title: trackTitle,
+          author: trackAuthor,
+          platform: 'youtube_music',
+          sourceUrl: parsedUrl.normalizedUrl,
+          streamUrl,
+          thumbnailUrl: entry.thumbnail ?? payload.thumbnail,
+          durationSeconds: entry.duration ?? payload.duration,
+          estimatedBytes: est,
+          limitBytes: maxLimitBytes,
+          sourceExt: audioFormat?.ext,
+          headers: mergeCookieHeader(
+            audioFormat?.http_headers ?? entry.http_headers,
+            audioFormat?.cookies ?? entry.cookies
+          ),
+          strategy: isDirectMp3 ? 'direct_http' : 'ffmpeg_extract_mp3',
+          filenameBase: trackAuthor
+            ? `${trackAuthor} - ${trackTitle}${suffix}`
+            : `${trackTitle}${suffix}`,
+        })
+      );
+    }
+
+    if (assets.length === 0) {
+      throw new Error('No downloadable YouTube Music audio streams were found.');
+    }
+
+    return { title, author, assets, warnings };
+  }
+
+  interface PendingVisualItem {
+    entry: YtDlpEntry;
+    picked: NonNullable<ReturnType<typeof pickFormatsForEntry>>;
+    itemTitle: string;
+    itemAuthor?: string;
+    suffix: string;
+  }
+
+  const pendingItems: PendingVisualItem[] = [];
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i];
     if (!entry) continue;
@@ -473,26 +616,45 @@ async function extractWithYtDlp(
     );
     if (!picked) continue;
 
-    let estimatedBytes = picked.estimatedBytes;
-    if (!estimatedBytes && picked.strategy === 'direct_http') {
-      estimatedBytes = await probeContentLength(picked.streamUrl, picked.headers);
-    }
+    pendingItems.push({
+      entry,
+      picked,
+      itemTitle: entry.title || title,
+      itemAuthor: cleanMusicAuthor(entry.artist || entry.uploader || entry.channel || author),
+      suffix: entries.length > 1 ? `_${i + 1}` : '',
+    });
+  }
 
+  // Probe missing sizes in parallel to avoid sequential network delays on carousels
+  const probedSizes = await Promise.all(
+    pendingItems.map(async ({ picked }) => {
+      if (
+        !options.skipHeadProbe &&
+        !picked.estimatedBytes &&
+        picked.strategy === 'direct_http'
+      ) {
+        return probeContentLength(picked.streamUrl, picked.headers);
+      }
+      return picked.estimatedBytes;
+    })
+  );
+
+  for (let i = 0; i < pendingItems.length; i += 1) {
+    const { entry, picked, itemTitle, itemAuthor, suffix } = pendingItems[i];
+    const estimatedBytes = probedSizes[i];
     const exceedsLimit =
       typeof estimatedBytes === 'number' && estimatedBytes > maxLimitBytes;
 
-    const itemTitle = entry.title || title;
-    const suffix = entries.length > 1 ? `_${i + 1}` : '';
-
-    assets.push({
+    const visualAsset: MediaAsset = {
       id: randomUUID(),
       kind: picked.kind,
       title: itemTitle,
-      author,
+      author: itemAuthor,
       platform: parsedUrl.platform,
       sourceUrl: parsedUrl.normalizedUrl,
       streamUrl: picked.streamUrl,
       audioStreamUrl: picked.audioStreamUrl,
+      audioExt: picked.audioExt,
       thumbnailUrl: entry.thumbnail ?? payload.thumbnail,
       filename: sanitizeFilename(`${itemTitle}${suffix}`, picked.ext),
       mimeType:
@@ -511,44 +673,115 @@ async function extractWithYtDlp(
       strategy: picked.strategy,
       headers: picked.headers,
       resolutionLabel: picked.resolutionLabel,
-    });
-  }
+    };
+    assets.push(visualAsset);
 
-  // TikTok special requirement: extract and send MP3 audio alongside video/slideshow
-  if (parsedUrl.platform === 'tiktok') {
-    const audioOnlyFormat = (payload.formats ?? []).find(
-      (f) =>
-        Boolean(f.url) &&
-        f.acodec &&
-        f.acodec !== 'none' &&
-        (!f.vcodec || f.vcodec === 'none')
-    );
+    // Extract video sound as MP3 music for YouTube, YouTube Shorts, Instagram videos, and TikTok
+    if (
+      AUDIO_EXTRACTION_PLATFORMS.has(parsedUrl.platform) &&
+      (picked.kind === 'video' || parsedUrl.platform === 'tiktok')
+    ) {
+      const audioOnlyFormat = pickBestAudioFormat(entry);
+      const audioUpstream =
+        audioOnlyFormat?.url ?? picked.audioStreamUrl ?? (picked.kind === 'video' ? picked.streamUrl : undefined);
 
-    const videoSource = assets.find((a) => a.kind === 'video');
-    const audioUpstream = audioOnlyFormat?.url ?? videoSource?.streamUrl;
-
-    if (audioUpstream) {
-      assets.push({
-        id: randomUUID(),
-        kind: 'audio',
-        title: `${title} (Audio)`,
-        author,
-        platform: 'tiktok',
-        sourceUrl: parsedUrl.normalizedUrl,
-        streamUrl: audioUpstream,
-        thumbnailUrl: payload.thumbnail,
-        filename: sanitizeFilename(`${title}_audio`, 'mp3'),
-        mimeType: 'audio/mpeg',
-        ext: 'mp3',
-        durationSeconds: payload.duration,
-        estimatedBytes: undefined,
-        exceedsLimit: false,
-        limitBytes: maxLimitBytes,
-        strategy: 'ffmpeg_extract_mp3',
-        headers: audioOnlyFormat?.http_headers ?? videoSource?.headers,
-      });
+      if (audioUpstream) {
+        const trackTitle = entry.track || `${itemTitle} (Audio)`;
+        const trackAuthor = cleanMusicAuthor(entry.artist) || itemAuthor;
+        const audioEst = audioOnlyFormat?.filesize ?? audioOnlyFormat?.filesize_approx;
+        const isDirectMp3 = audioOnlyFormat?.ext === 'mp3';
+        const preserveYoutubeAudio =
+          (parsedUrl.platform === 'youtube' || parsedUrl.platform === 'youtube_shorts') &&
+          Boolean(audioOnlyFormat?.ext);
+        assets.push(
+          buildAudioAssetFromSource({
+            title: trackTitle,
+            author: trackAuthor,
+            platform: parsedUrl.platform,
+            sourceUrl: parsedUrl.normalizedUrl,
+            streamUrl: audioUpstream,
+            thumbnailUrl: entry.thumbnail ?? payload.thumbnail,
+            durationSeconds: entry.duration ?? payload.duration,
+            estimatedBytes: audioEst,
+            limitBytes: maxLimitBytes,
+            sourceExt: preserveYoutubeAudio ? audioOnlyFormat?.ext : undefined,
+            headers: mergeCookieHeader(
+              audioOnlyFormat?.http_headers ?? picked.headers,
+              audioOnlyFormat?.cookies ?? entry.cookies
+            ),
+            strategy:
+              preserveYoutubeAudio || isDirectMp3
+                ? 'direct_http'
+                : 'ffmpeg_extract_mp3',
+            filenameBase: `${itemTitle}${suffix}_audio`,
+          })
+        );
+      }
     }
   }
+
+  return { title, author, assets, warnings };
+}
+
+async function extractWithYtDlp(
+  parsedUrl: ParsedMediaUrl,
+  options: ExtractionOptions
+): Promise<ExtractionResult> {
+  const start = Date.now();
+  const maxLimitBytes = options.maxLimitBytes ?? DEFAULT_LIMIT_BYTES;
+  const quality = options.youtubeQuality ?? '720';
+  const ytDlpBin = await ensureYtDlpBinary();
+
+  const args = [
+    '--dump-single-json',
+    '--js-runtimes',
+    'node',
+    '--no-warnings',
+    '--skip-download',
+    '--socket-timeout',
+    '10',
+    '--extractor-retries',
+    '1',
+    '--user-agent',
+    USER_AGENT,
+  ];
+
+  if (options.proxyUrl?.trim()) {
+    args.push('--proxy', options.proxyUrl.trim());
+  }
+  if (options.cookiesHeader?.trim()) {
+    args.push('--add-header', `Cookie:${options.cookiesHeader.trim()}`);
+  }
+  if (
+    parsedUrl.platform === 'youtube' ||
+    parsedUrl.platform === 'youtube_shorts'
+  ) {
+    args.push('--no-playlist');
+  } else if (parsedUrl.platform === 'youtube_music') {
+    const u = new URL(parsedUrl.normalizedUrl);
+    if (u.pathname.startsWith('/playlist')) {
+      args.push('--playlist-end', '20');
+    } else {
+      args.push('--no-playlist');
+    }
+  }
+
+  args.push(parsedUrl.normalizedUrl);
+
+  const { stdout } = await execFileAsync(ytDlpBin, args, {
+    shell: false,
+    timeout: 28_000,
+    maxBuffer: 20 * 1024 * 1024,
+  });
+
+  const payload = JSON.parse(stdout) as YtDlpEntry;
+  const { title, author, assets, warnings } = await buildAssetsFromYtDlpPayload(
+    payload,
+    parsedUrl,
+    quality,
+    maxLimitBytes,
+    { skipHeadProbe: true }
+  );
 
   if (assets.length === 0) {
     throw new Error('No downloadable media streams were found in extractor output.');
@@ -1066,6 +1299,117 @@ async function extractRedditFallback(
   };
 }
 
+export interface TikWmData {
+  id?: string;
+  title?: string;
+  cover?: string;
+  duration?: number;
+  play?: string;
+  hdplay?: string;
+  music?: string;
+  music_info?: { title?: string; author?: string };
+  author?: { unique_id?: string; nickname?: string };
+  images?: string[];
+  size?: number;
+  hd_size?: number;
+}
+
+function normalizeTikWmUrl(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+  try {
+    return new URL(raw, 'https://www.tikwm.com').toString();
+  } catch {
+    return undefined;
+  }
+}
+
+export function buildAssetsFromTikWmData(
+  d: TikWmData,
+  normalizedUrl: string,
+  maxLimitBytes: number
+): { title: string; author?: string; assets: MediaAsset[] } {
+  const title = d.title || `TikTok ${d.id || ''}`.trim();
+  const author = d.author?.unique_id ? `@${d.author.unique_id}` : d.author?.nickname;
+  const coverUrl = normalizeTikWmUrl(d.cover);
+  const assets: MediaAsset[] = [];
+
+  if (Array.isArray(d.images) && d.images.length > 0) {
+    d.images.forEach((rawImgUrl, idx) => {
+      const imgUrl = normalizeTikWmUrl(rawImgUrl);
+      if (!imgUrl) return;
+      assets.push({
+        id: randomUUID(),
+        kind: 'photo',
+        title,
+        author,
+        platform: 'tiktok',
+        sourceUrl: normalizedUrl,
+        streamUrl: imgUrl,
+        thumbnailUrl: imgUrl,
+        filename: sanitizeFilename(`${title}_slide_${idx + 1}`, 'jpg'),
+        mimeType: 'image/jpeg',
+        ext: 'jpg',
+        exceedsLimit: false,
+        limitBytes: maxLimitBytes,
+        strategy: 'direct_http',
+      });
+    });
+  } else {
+    const hdPlayUrl = normalizeTikWmUrl(d.hdplay);
+    const playUrl = normalizeTikWmUrl(d.play);
+    const videoUrl =
+      hdPlayUrl && (!d.hd_size || d.hd_size <= maxLimitBytes) ? hdPlayUrl : playUrl;
+    if (videoUrl) {
+      const est = hdPlayUrl === videoUrl ? d.hd_size : d.size;
+      assets.push({
+        id: randomUUID(),
+        kind: 'video',
+        title,
+        author,
+        platform: 'tiktok',
+        sourceUrl: normalizedUrl,
+        streamUrl: videoUrl,
+        thumbnailUrl: coverUrl,
+        filename: sanitizeFilename(title, 'mp4'),
+        mimeType: 'video/mp4',
+        ext: 'mp4',
+        durationSeconds: d.duration,
+        estimatedBytes: est,
+        exceedsLimit: typeof est === 'number' && est > maxLimitBytes,
+        limitBytes: maxLimitBytes,
+        strategy: 'direct_http',
+      });
+    }
+  }
+
+  // Always include separate MP3 audio track for TikTok
+  const musicUrl = normalizeTikWmUrl(d.music);
+  const playUrl = normalizeTikWmUrl(d.play);
+  const audioSrc = musicUrl || playUrl;
+  if (audioSrc) {
+    const audioTitle = d.music_info?.title
+      ? `${d.music_info.title}${d.music_info.author ? ` - ${d.music_info.author}` : ''}`
+      : `${title} (Audio)`;
+    assets.push(
+      buildAudioAssetFromSource({
+        title: audioTitle,
+        author: d.music_info?.author || author,
+        platform: 'tiktok',
+        sourceUrl: normalizedUrl,
+        streamUrl: audioSrc,
+        thumbnailUrl: coverUrl,
+        durationSeconds: d.duration,
+        limitBytes: maxLimitBytes,
+        strategy: musicUrl ? 'direct_http' : 'ffmpeg_extract_mp3',
+        filenameBase: audioTitle,
+      })
+    );
+  }
+
+  return { title, author, assets };
+}
+
 // Fast TikTok Extractor via TikWM API (HD watermark-free MP4, Photo Slideshows, and MP3 audio)
 async function extractTikTokFallback(
   parsedUrl: ParsedMediaUrl,
@@ -1083,6 +1427,7 @@ async function extractTikTokFallback(
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
     },
     body: body.toString(),
+    signal: AbortSignal.timeout(6000),
     dispatcher: metadataHttpAgent,
   });
   if (!res.ok) {
@@ -1111,78 +1456,11 @@ async function extractTikTokFallback(
     throw new Error(payload.msg || 'TikWM returned no media data.');
   }
 
-  const d = payload.data;
-  const title = d.title || `TikTok ${d.id || ''}`.trim();
-  const author = d.author?.unique_id ? `@${d.author.unique_id}` : d.author?.nickname;
-  const assets: MediaAsset[] = [];
-
-  if (Array.isArray(d.images) && d.images.length > 0) {
-    d.images.forEach((imgUrl, idx) => {
-      assets.push({
-        id: randomUUID(),
-        kind: 'photo',
-        title,
-        author,
-        platform: 'tiktok',
-        sourceUrl: parsedUrl.normalizedUrl,
-        streamUrl: imgUrl,
-        thumbnailUrl: imgUrl,
-        filename: sanitizeFilename(`${title}_slide_${idx + 1}`, 'jpg'),
-        mimeType: 'image/jpeg',
-        ext: 'jpg',
-        exceedsLimit: false,
-        limitBytes: maxLimitBytes,
-        strategy: 'direct_http',
-      });
-    });
-  } else if (d.hdplay || d.play) {
-    const videoUrl =
-      d.hdplay && (!d.hd_size || d.hd_size <= maxLimitBytes) ? d.hdplay : d.play!;
-    const est = d.hdplay === videoUrl ? d.hd_size : d.size;
-    assets.push({
-      id: randomUUID(),
-      kind: 'video',
-      title,
-      author,
-      platform: 'tiktok',
-      sourceUrl: parsedUrl.normalizedUrl,
-      streamUrl: videoUrl,
-      thumbnailUrl: d.cover,
-      filename: sanitizeFilename(title, 'mp4'),
-      mimeType: 'video/mp4',
-      ext: 'mp4',
-      durationSeconds: d.duration,
-      estimatedBytes: est,
-      exceedsLimit: typeof est === 'number' && est > maxLimitBytes,
-      limitBytes: maxLimitBytes,
-      strategy: 'direct_http',
-    });
-  }
-
-  // Always include separate MP3 audio track for TikTok
-  const audioSrc = d.music || d.play;
-  if (audioSrc) {
-    const audioTitle = d.music_info?.title
-      ? `${d.music_info.title}${d.music_info.author ? ` - ${d.music_info.author}` : ''}`
-      : `${title} (Audio)`;
-    assets.push({
-      id: randomUUID(),
-      kind: 'audio',
-      title: audioTitle,
-      author: d.music_info?.author || author,
-      platform: 'tiktok',
-      sourceUrl: parsedUrl.normalizedUrl,
-      streamUrl: audioSrc,
-      thumbnailUrl: d.cover,
-      filename: sanitizeFilename(`${audioTitle}`, 'mp3'),
-      mimeType: 'audio/mpeg',
-      ext: 'mp3',
-      durationSeconds: d.duration,
-      exceedsLimit: false,
-      limitBytes: maxLimitBytes,
-      strategy: d.music ? 'direct_http' : 'ffmpeg_extract_mp3',
-    });
-  }
+  const { title, author, assets } = buildAssetsFromTikWmData(
+    payload.data,
+    parsedUrl.normalizedUrl,
+    maxLimitBytes
+  );
 
   if (assets.length === 0) {
     throw new Error('No media assets found in TikTok response.');
@@ -1198,6 +1476,215 @@ async function extractTikTokFallback(
     isCarousel: assets.filter((a) => a.kind !== 'audio').length > 1,
     hasSeparateAudio: assets.some((a) => a.kind === 'audio'),
     assets,
+    warnings: [],
+  };
+}
+
+interface TikTokItemStruct {
+  id?: string;
+  desc?: string;
+  author?: { uniqueId?: string; nickname?: string };
+  video?: {
+    duration?: number;
+    width?: number;
+    height?: number;
+    cover?: string;
+    playAddr?: string;
+    downloadAddr?: string;
+    bitrateInfo?: Array<{
+      Bitrate?: number;
+      PlayAddr?: { UrlList?: string[]; DataSize?: string | number };
+    }>;
+  };
+  music?: {
+    title?: string;
+    authorName?: string;
+    playUrl?: string;
+    duration?: number;
+  };
+  imagePost?: {
+    images?: Array<{
+      imageURL?: { urlList?: string[] };
+    }>;
+  };
+}
+
+export function parseTikTokHtmlPayload(
+  html: string,
+  normalizedUrl: string,
+  maxLimitBytes: number,
+  headers?: Record<string, string>
+): { title: string; author?: string; assets: MediaAsset[] } | null {
+  const match = html.match(
+    /<script[^>]*id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/i
+  );
+  if (!match?.[1]) return null;
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(match[1]) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  const defaultScope = parsed.__DEFAULT_SCOPE__ as Record<string, unknown> | undefined;
+  const videoDetail = defaultScope?.['webapp.video-detail'] as
+    | { itemInfo?: { itemStruct?: TikTokItemStruct } }
+    | undefined;
+  const item = videoDetail?.itemInfo?.itemStruct;
+  if (!item) return null;
+
+  const title = item.desc?.trim() || `TikTok ${item.id || ''}`.trim();
+  const author = item.author?.uniqueId ? `@${item.author.uniqueId}` : item.author?.nickname;
+  const assets: MediaAsset[] = [];
+  const duration = item.video?.duration ?? item.music?.duration;
+  const cover = item.video?.cover;
+
+  const images = item.imagePost?.images;
+  if (Array.isArray(images) && images.length > 0) {
+    images.forEach((img, idx) => {
+      const imgUrl = img.imageURL?.urlList?.[0];
+      if (!imgUrl) return;
+      assets.push({
+        id: randomUUID(),
+        kind: 'photo',
+        title,
+        author,
+        platform: 'tiktok',
+        sourceUrl: normalizedUrl,
+        streamUrl: imgUrl,
+        thumbnailUrl: imgUrl,
+        filename: sanitizeFilename(`${title}_slide_${idx + 1}`, 'jpg'),
+        mimeType: 'image/jpeg',
+        ext: 'jpg',
+        exceedsLimit: false,
+        limitBytes: maxLimitBytes,
+        strategy: 'direct_http',
+        headers,
+      });
+    });
+  } else if (item.video) {
+    const bitrates = Array.isArray(item.video.bitrateInfo)
+      ? [...item.video.bitrateInfo].sort((a, b) => (b.Bitrate ?? 0) - (a.Bitrate ?? 0))
+      : [];
+    const bestBitrate = bitrates.find((b) => {
+      const sz = Number(b.PlayAddr?.DataSize);
+      return b.PlayAddr?.UrlList?.[0] && (!Number.isFinite(sz) || sz <= maxLimitBytes);
+    });
+    const videoUrl =
+      bestBitrate?.PlayAddr?.UrlList?.[0] ||
+      item.video.playAddr ||
+      item.video.downloadAddr;
+
+    if (videoUrl) {
+      const rawSz = Number(bestBitrate?.PlayAddr?.DataSize);
+      const est = Number.isFinite(rawSz) && rawSz > 0 ? rawSz : undefined;
+      assets.push({
+        id: randomUUID(),
+        kind: 'video',
+        title,
+        author,
+        platform: 'tiktok',
+        sourceUrl: normalizedUrl,
+        streamUrl: videoUrl,
+        thumbnailUrl: cover,
+        filename: sanitizeFilename(title, 'mp4'),
+        mimeType: 'video/mp4',
+        ext: 'mp4',
+        width: item.video.width,
+        height: item.video.height,
+        durationSeconds: duration,
+        estimatedBytes: est,
+        exceedsLimit: typeof est === 'number' && est > maxLimitBytes,
+        limitBytes: maxLimitBytes,
+        strategy: 'direct_http',
+        headers,
+      });
+    }
+  }
+
+  const videoSource = assets.find((a) => a.kind === 'video');
+  const musicUrl = item.music?.playUrl;
+  const audioSrc = musicUrl || videoSource?.streamUrl;
+  if (audioSrc) {
+    const musicTitle = item.music?.title
+      ? `${item.music.title}${item.music.authorName ? ` - ${item.music.authorName}` : ''}`
+      : `${title} (Audio)`;
+    const looksLikeMp3 = Boolean(musicUrl) && /\.mp3(\?|$)/i.test(musicUrl!);
+    assets.push(
+      buildAudioAssetFromSource({
+        title: musicTitle,
+        author: item.music?.authorName || author,
+        platform: 'tiktok',
+        sourceUrl: normalizedUrl,
+        streamUrl: audioSrc,
+        thumbnailUrl: cover,
+        durationSeconds: duration,
+        limitBytes: maxLimitBytes,
+        headers,
+        strategy: looksLikeMp3 ? 'direct_http' : 'ffmpeg_extract_mp3',
+        filenameBase: musicTitle,
+      })
+    );
+  }
+
+  return assets.length > 0 ? { title, author, assets } : null;
+}
+
+// Fast TikTok Direct HTML Rehydration Extractor (avoids spawning yt-dlp if TikWM rate-limits)
+async function extractTikTokDirectHtml(
+  parsedUrl: ParsedMediaUrl,
+  maxLimitBytes: number
+): Promise<ExtractionResult> {
+  const start = Date.now();
+  const res = await undiciFetch(parsedUrl.normalizedUrl, {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(6000),
+    dispatcher: metadataHttpAgent,
+  });
+  if (!res.ok) {
+    throw new Error(`TikTok direct HTML fetch failed (${res.status})`);
+  }
+
+  const setCookies =
+    typeof res.headers.getSetCookie === 'function'
+      ? res.headers.getSetCookie()
+      : [];
+  const cookieHeader = setCookies
+    .map((c) => c.split(';')[0]?.trim())
+    .filter(Boolean)
+    .join('; ');
+  const streamHeaders: Record<string, string> = {
+    Referer: 'https://www.tiktok.com/',
+    ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+  };
+
+  const html = await res.text();
+  const parsed = parseTikTokHtmlPayload(
+    html,
+    parsedUrl.normalizedUrl,
+    maxLimitBytes,
+    streamHeaders
+  );
+  if (!parsed) {
+    throw new Error('Could not parse TikTok rehydration data from page HTML.');
+  }
+
+  return {
+    platform: 'tiktok',
+    sourceUrl: parsedUrl.normalizedUrl,
+    title: parsed.title,
+    author: parsed.author,
+    extractorUsed: 'tiktok-direct-html',
+    extractionMs: Date.now() - start,
+    isCarousel: parsed.assets.filter((a) => a.kind !== 'audio').length > 1,
+    hasSeparateAudio: parsed.assets.some((a) => a.kind === 'audio'),
+    assets: parsed.assets,
     warnings: [],
   };
 }
@@ -1339,19 +1826,31 @@ async function extractInstagramFallback(
 
       const videoRegex =
         /(?:"video_url"\s*:\s*"([^"]+)"|<meta property="og:video(?::secure_url)?" content="([^"]+)")/gi;
+      const matchedVideos: string[] = [];
       for (const m of html.matchAll(videoRegex)) {
         const raw = decodeHtml(m[1] || m[2] || '');
         if (!raw.startsWith('http') || seen.has(raw)) continue;
         seen.add(raw);
-        const est = await probeContentLength(raw);
+        matchedVideos.push(raw);
+      }
+
+      const probedVideoSizes = await Promise.all(
+        matchedVideos.map((raw) => probeContentLength(raw))
+      );
+
+      for (let idx = 0; idx < matchedVideos.length; idx += 1) {
+        const raw = matchedVideos[idx];
+        const est = probedVideoSizes[idx];
+        const igTitle = `Instagram ${normalizedKind} ${shortcode}`;
+        const videoIdx = idx + 1;
         assets.push({
           id: randomUUID(),
           kind: 'video',
-          title: `Instagram ${normalizedKind} ${shortcode}`,
+          title: igTitle,
           platform: 'instagram',
           sourceUrl: parsedUrl.normalizedUrl,
           streamUrl: raw,
-          filename: sanitizeFilename(`ig_${shortcode}_${assets.length + 1}`, 'mp4'),
+          filename: sanitizeFilename(`ig_${shortcode}_${videoIdx}`, 'mp4'),
           mimeType: 'video/mp4',
           ext: 'mp4',
           estimatedBytes: est,
@@ -1359,6 +1858,19 @@ async function extractInstagramFallback(
           limitBytes: maxLimitBytes,
           strategy: 'direct_http',
         });
+
+        // Also extract Instagram video sound as MP3 music
+        assets.push(
+          buildAudioAssetFromSource({
+            title: `${igTitle} (Audio)`,
+            platform: 'instagram',
+            sourceUrl: parsedUrl.normalizedUrl,
+            streamUrl: raw,
+            limitBytes: maxLimitBytes,
+            strategy: 'ffmpeg_extract_mp3',
+            filenameBase: `ig_${shortcode}_${videoIdx}_audio`,
+          })
+        );
       }
 
       if (assets.length === 0) {
@@ -1395,8 +1907,8 @@ async function extractInstagramFallback(
             ? 'kkinstagram-og'
             : 'instagram-embed',
           extractionMs: Date.now() - start,
-          isCarousel: assets.length > 1,
-          hasSeparateAudio: false,
+          isCarousel: assets.filter((a) => a.kind !== 'audio').length > 1,
+          hasSeparateAudio: assets.some((a) => a.kind === 'audio'),
           assets,
           warnings: [],
         };
@@ -1409,19 +1921,43 @@ async function extractInstagramFallback(
   throw new Error('Instagram embed/OG extraction returned no public media.');
 }
 
-export async function extractMedia(
+const EXTRACTION_CACHE_TTL_MS = 90_000;
+const extractionCache = new Map<
+  string,
+  { result: ExtractionResult; expiresAt: number }
+>();
+const inflightExtractions = new Map<string, Promise<ExtractionResult>>();
+
+function cloneExtractionWithFreshIds(res: ExtractionResult): ExtractionResult {
+  return {
+    ...res,
+    assets: res.assets.map((asset) => ({
+      ...asset,
+      id: randomUUID(),
+    })),
+  };
+}
+
+async function runExtractionPipeline(
   parsedUrl: ParsedMediaUrl,
-  options: ExtractionOptions = {}
+  options: ExtractionOptions
 ): Promise<ExtractionResult> {
   const maxLimitBytes = options.maxLimitBytes ?? DEFAULT_LIMIT_BYTES;
   const errors: string[] = [];
 
-  // For TikTok, TikWM resolves watermark-free HD MP4, photo slideshows, and MP3 in <1s without CDN cookie walls.
+  // For TikTok, TikWM resolves watermark-free HD MP4, photo slideshows, and MP3 in <1s.
+  // If TikWM rate-limits or fails, try fast direct HTML rehydration before spawning yt-dlp.
   if (parsedUrl.platform === 'tiktok') {
     try {
       return await extractTikTokFallback(parsedUrl, maxLimitBytes);
     } catch (err) {
       errors.push(`tikwm: ${(err as Error).message}`);
+    }
+
+    try {
+      return await extractTikTokDirectHtml(parsedUrl, maxLimitBytes);
+    } catch (err) {
+      errors.push(`tiktok-direct: ${(err as Error).message}`);
     }
   }
 
@@ -1466,4 +2002,52 @@ export async function extractMedia(
   throw new Error(
     `Extraction failed for ${parsedUrl.platform}. ${errors.join(' | ')}`
   );
+}
+
+export async function extractMedia(
+  parsedUrl: ParsedMediaUrl,
+  options: ExtractionOptions = {}
+): Promise<ExtractionResult> {
+  const maxLimitBytes = options.maxLimitBytes ?? DEFAULT_LIMIT_BYTES;
+  const quality = options.youtubeQuality ?? '720';
+  const canUseCache = !options.proxyUrl?.trim() && !options.cookiesHeader?.trim();
+  const cacheKey = `${parsedUrl.normalizedUrl}|${quality}|${maxLimitBytes}`;
+
+  if (canUseCache) {
+    const cached = extractionCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cloneExtractionWithFreshIds(cached.result);
+    }
+    if (cached) extractionCache.delete(cacheKey);
+
+    const inflight = inflightExtractions.get(cacheKey);
+    if (inflight) {
+      const result = await inflight;
+      return cloneExtractionWithFreshIds(result);
+    }
+  }
+
+  const job = runExtractionPipeline(parsedUrl, options);
+  if (canUseCache) {
+    inflightExtractions.set(cacheKey, job);
+  }
+
+  try {
+    const result = await job;
+    if (canUseCache) {
+      if (extractionCache.size >= 100) {
+        const oldest = extractionCache.keys().next().value;
+        if (oldest) extractionCache.delete(oldest);
+      }
+      extractionCache.set(cacheKey, {
+        result,
+        expiresAt: Date.now() + EXTRACTION_CACHE_TTL_MS,
+      });
+    }
+    return cloneExtractionWithFreshIds(result);
+  } finally {
+    if (canUseCache) {
+      inflightExtractions.delete(cacheKey);
+    }
+  }
 }

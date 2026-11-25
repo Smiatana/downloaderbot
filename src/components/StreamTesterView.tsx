@@ -21,6 +21,10 @@ import {
 
 const QUICK_EXAMPLES = [
   {
+    label: 'YouTube Music',
+    url: 'https://music.youtube.com/watch?v=aqz-KE-bpKQ',
+  },
+  {
     label: 'YouTube Shorts',
     url: 'https://www.youtube.com/shorts/aqz-KE-bpKQ',
   },
@@ -98,7 +102,7 @@ export function StreamTesterView() {
             Zero-Disk Stream Inspector
           </h2>
           <p className="text-sm text-slate-600 max-w-2xl">
-            Paste a link from Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, or YouTube Shorts to resolve direct streams and pipe media straight to your browser or Telegram without local file writes.
+            Paste a link from Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, YouTube Shorts, or YouTube Music to resolve direct streams and pipe video or MP3 music straight to your browser or Telegram without local file writes.
           </p>
         </div>
 
@@ -249,7 +253,7 @@ export function StreamTesterView() {
             Ready to resolve media streams
           </p>
           <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-            Enter a supported social media URL above. Video, carousel images, GIFs, and TikTok MP3 audio tracks will appear here ready for live playback or direct memory-to-HTTP download.
+            Enter a supported media URL above. Video, carousel images, GIFs, YouTube Music tracks, and extracted MP3 audio from YouTube, Instagram videos, and TikTok will appear here ready for live playback or direct memory-to-HTTP download.
           </p>
         </section>
       )}

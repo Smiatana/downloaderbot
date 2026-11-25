@@ -5,7 +5,8 @@ export type PlatformId =
   | 'reddit'
   | 'tumblr'
   | 'youtube'
-  | 'youtube_shorts';
+  | 'youtube_shorts'
+  | 'youtube_music';
 
 export type MediaKind = 'video' | 'photo' | 'animation' | 'audio';
 
@@ -17,6 +18,7 @@ export type StreamStrategy =
   | 'ytdlp_stdout';
 
 export type YouTubeQuality = '360' | '720' | '1080';
+export type BotMediaMode = 'video' | 'music' | 'both';
 
 export interface MediaAsset {
   id: string;
@@ -62,6 +64,7 @@ export interface BotStatusSnapshot {
   limitMb: number;
   concurrency: number;
   youtubeQuality: YouTubeQuality;
+  mediaMode: BotMediaMode;
   autoCompressOverLimit: boolean;
   hasToken: boolean;
   hasProxy: boolean;
@@ -118,6 +121,7 @@ export const PLATFORM_LABELS: Record<PlatformId, string> = {
   tumblr: 'Tumblr',
   youtube: 'YouTube',
   youtube_shorts: 'YouTube Shorts',
+  youtube_music: 'YouTube Music',
 };
 
 export const STRATEGY_LABELS: Record<StreamStrategy, string> = {

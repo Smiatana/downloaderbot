@@ -7,14 +7,18 @@ import type { MediaAsset } from './types.ts';
 import { assertSafeUpstreamMediaUrl } from './urlRouter.ts';
 
 const streamHttpAgent = new Agent({
-  connections: 64,
+  connections: 24,
   pipelining: 1,
-  keepAliveTimeout: 30_000,
-  connectTimeout: 12_000,
+  keepAliveTimeout: 60_000,
+  connectTimeout: 10_000,
 });
 
 const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+function appendStderr(current: string, chunk: Buffer): string {
+  return `${current}${chunk.toString()}`.slice(-4096);
+}
 
 export interface OpenedZeroDiskStream {
   stream: Readable;
@@ -28,7 +32,7 @@ function attachByteMeter(
   source: Readable,
   onComplete?: (totalBytes: number, durationMs: number) => void
 ): PassThrough {
-  const meter = new PassThrough({ highWaterMark: 64 * 1024 });
+  const meter = new PassThrough({ highWaterMark: 256 * 1024 });
   let totalBytes = 0;
   const startedAt = Date.now();
   let finalized = false;
@@ -95,6 +99,10 @@ export async function openZeroDiskStream(
   // Strategy 1: Zero-disk DASH video+audio muxing via FFmpeg pipe:1
   if (shouldMuxDash && asset.audioStreamUrl) {
     const headerBlock = buildFfmpegHeadersArg(asset.headers);
+    const isAudioAacCompatible =
+      asset.audioExt === 'm4a' ||
+      asset.audioExt === 'mp4' ||
+      /\.m4a(\?|$)|DASH_AUDIO/i.test(asset.audioStreamUrl);
     const ffmpegArgs = [
       '-loglevel',
       'error',
@@ -108,10 +116,7 @@ export async function openZeroDiskStream(
       asset.audioStreamUrl,
       '-c:v',
       'copy',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '128k',
+      ...(isAudioAacCompatible ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '128k']),
       '-f',
       'mp4',
       '-movflags',
@@ -126,7 +131,7 @@ export async function openZeroDiskStream(
 
     let stderrMsg = '';
     proc.stderr.on('data', (d: Buffer) => {
-      stderrMsg += d.toString();
+      stderrMsg = appendStderr(stderrMsg, d);
     });
     proc.on('close', (code) => {
       if (code && code !== 0 && !proc.stdout.destroyed) {
@@ -160,20 +165,134 @@ export async function openZeroDiskStream(
   if (!upstreamRes.ok || !upstreamRes.body) {
     // Fallback for signed CDN URLs that reject direct HTTP fetch: stream yt-dlp stdout directly
     if (
-      asset.kind === 'video' &&
-      !shouldExtractMp3 &&
+      (asset.kind === 'video' || asset.kind === 'audio' || shouldExtractMp3) &&
       !shouldCompress &&
       asset.sourceUrl
     ) {
       const { ensureYtDlpBinary } = await import('./extractor.ts');
       const ytDlpBin = await ensureYtDlpBinary();
+
+      if (shouldExtractMp3) {
+        const ytdlpProc = spawn(
+          ytDlpBin,
+          [
+            '-f',
+            'bestaudio/best',
+            '--js-runtimes',
+            'node',
+            '--no-warnings',
+            '-o',
+            '-',
+            asset.sourceUrl,
+          ],
+          { shell: false, stdio: ['ignore', 'pipe', 'pipe'] }
+        );
+        const ffmpegProc = spawn(
+          'ffmpeg',
+          [
+            '-loglevel',
+            'error',
+            '-fflags',
+            '+flush_packets',
+            '-i',
+            'pipe:0',
+            '-vn',
+            '-sn',
+            '-dn',
+            '-c:a',
+            'libmp3lame',
+            '-q:a',
+            '3',
+            '-compression_level',
+            '2',
+            '-id3v2_version',
+            '3',
+            ...(asset.title ? ['-metadata', `title=${asset.title.replace(/[\r\n]/g, ' ')}`] : []),
+            ...(asset.author ? ['-metadata', `artist=${asset.author.replace(/[\r\n]/g, ' ')}`] : []),
+            '-f',
+            'mp3',
+            'pipe:1',
+          ],
+          { shell: false, stdio: ['pipe', 'pipe', 'pipe'] }
+        );
+
+        let stderrMsg = '';
+        ffmpegProc.stderr.on('data', (d: Buffer) => {
+          stderrMsg = appendStderr(stderrMsg, d);
+        });
+        ytdlpProc.stdout.pipe(ffmpegProc.stdin);
+        ytdlpProc.stdout.on('error', (err) => {
+          if (!ffmpegProc.killed) ffmpegProc.kill('SIGKILL');
+          ffmpegProc.stdout.destroy(err);
+        });
+        ffmpegProc.stdin.on('error', () => {});
+        ffmpegProc.on('close', (code) => {
+          if (code && code !== 0 && !ffmpegProc.stdout.destroyed) {
+            ffmpegProc.stdout.destroy(
+              new Error(`yt-dlp MP3 fallback exited ${code}: ${stderrMsg.slice(0, 200)}`)
+            );
+          }
+        });
+
+        const metered = attachByteMeter(ffmpegProc.stdout, options.onComplete);
+        return {
+          stream: metered,
+          contentType: 'audio/mpeg',
+          filename: asset.filename.replace(/\.[^.]+$/, '.mp3'),
+          cleanup: () => {
+            if (!ytdlpProc.killed) ytdlpProc.kill('SIGKILL');
+            if (!ffmpegProc.killed) ffmpegProc.kill('SIGKILL');
+          },
+        };
+      }
+
+      if (asset.kind === 'audio') {
+        const proc = spawn(
+          ytDlpBin,
+          [
+            '-f',
+            'bestaudio/best',
+            '--js-runtimes',
+            'node',
+            '--no-warnings',
+            '-o',
+            '-',
+            asset.sourceUrl,
+          ],
+          { shell: false, stdio: ['ignore', 'pipe', 'pipe'] }
+        );
+        let stderrMsg = '';
+        proc.stderr.on('data', (chunk: Buffer) => {
+          stderrMsg = appendStderr(stderrMsg, chunk);
+        });
+        proc.on('error', (err) => proc.stdout.destroy(err));
+        proc.on('close', (code) => {
+          if (code && code !== 0 && !proc.stdout.destroyed) {
+            proc.stdout.destroy(
+              new Error(`yt-dlp audio fallback exited ${code}: ${stderrMsg.slice(-200)}`)
+            );
+          }
+        });
+
+        const metered = attachByteMeter(proc.stdout, options.onComplete);
+        return {
+          stream: metered,
+          contentType: asset.mimeType,
+          filename: asset.filename,
+          cleanup: () => {
+            if (!proc.killed) proc.kill('SIGKILL');
+          },
+        };
+      }
+
       const proc = spawn(
         ytDlpBin,
         [
           '-f',
           'best[ext=mp4]/best',
+          '--js-runtimes',
+          'node',
           '--no-warnings',
-          '--no-check-certificates',
           '-o',
           '-',
           asset.sourceUrl,
@@ -186,7 +305,7 @@ export async function openZeroDiskStream(
 
       let stderrMsg = '';
       proc.stderr.on('data', (d: Buffer) => {
-        stderrMsg += d.toString();
+        stderrMsg = appendStderr(stderrMsg, d);
       });
       proc.on('close', (code) => {
         if (code && code !== 0 && !proc.stdout.destroyed) {
@@ -213,19 +332,35 @@ export async function openZeroDiskStream(
   const upstreamReadable = Readable.fromWeb(
     upstreamRes.body as unknown as WebReadableStream
   );
+  const upstreamContentType = (upstreamRes.headers.get('content-type') || '').toLowerCase();
 
-  // Strategy 2: On-the-fly TikTok MP3 extraction via FFmpeg pipe:0 -> pipe:1
-  if (shouldExtractMp3) {
+  // Strategy 2: On-the-fly MP3 extraction via FFmpeg pipe:0 -> pipe:1
+  // Skip FFmpeg completely if the upstream response is already MP3 (zero-transcode pass-through)
+  if (
+    shouldExtractMp3 &&
+    !upstreamContentType.includes('audio/mpeg') &&
+    !upstreamContentType.includes('audio/mp3')
+  ) {
     const ffmpegArgs = [
       '-loglevel',
       'error',
+      '-fflags',
+      '+flush_packets',
       '-i',
       'pipe:0',
       '-vn',
-      '-acodec',
+      '-sn',
+      '-dn',
+      '-c:a',
       'libmp3lame',
       '-q:a',
+      '3',
+      '-compression_level',
       '2',
+      '-id3v2_version',
+      '3',
+      ...(asset.title ? ['-metadata', `title=${asset.title.replace(/[\r\n]/g, ' ')}`] : []),
+      ...(asset.author ? ['-metadata', `artist=${asset.author.replace(/[\r\n]/g, ' ')}`] : []),
       '-f',
       'mp3',
       'pipe:1',
@@ -238,7 +373,7 @@ export async function openZeroDiskStream(
 
     let stderrMsg = '';
     proc.stderr.on('data', (d: Buffer) => {
-      stderrMsg += d.toString();
+      stderrMsg = appendStderr(stderrMsg, d);
     });
 
     upstreamReadable.pipe(proc.stdin);

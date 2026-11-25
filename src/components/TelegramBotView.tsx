@@ -8,11 +8,15 @@ import {
   Save,
   ShieldCheck,
   Square,
+  Video,
+  Music2,
+  Layers2,
 } from 'lucide-react';
 import {
   formatBytes,
   PLATFORM_LABELS,
   type BotStatusSnapshot,
+  type BotMediaMode,
   type StreamEventLog,
   type YouTubeQuality,
 } from '../types.ts';
@@ -36,6 +40,7 @@ export function TelegramBotView({
   const [youtubeQuality, setYoutubeQuality] = useState<YouTubeQuality>(
     botStatus.youtubeQuality
   );
+  const [mediaMode, setMediaMode] = useState<BotMediaMode>(botStatus.mediaMode);
   const [autoCompress, setAutoCompress] = useState(
     botStatus.autoCompressOverLimit
   );
@@ -60,6 +65,7 @@ export function TelegramBotView({
           apiRoot: apiRoot.trim() || 'https://api.telegram.org',
           concurrency,
           youtubeQuality,
+          mediaMode,
           autoCompressOverLimit: autoCompress,
           proxyUrl: proxyUrl.trim(),
           cookiesHeader: cookiesHeader.trim(),
@@ -126,6 +132,7 @@ export function TelegramBotView({
           apiRoot: apiRoot.trim() || 'https://api.telegram.org',
           concurrency,
           youtubeQuality,
+          mediaMode,
           autoCompressOverLimit: autoCompress,
           proxyUrl: proxyUrl.trim(),
           cookiesHeader: cookiesHeader.trim(),
@@ -251,7 +258,7 @@ export function TelegramBotView({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-5">
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1.5">
                 Async Worker Concurrency ({concurrency} jobs)
@@ -268,6 +275,34 @@ export function TelegramBotView({
                 <span>1</span>
                 <span>16</span>
                 <span>32</span>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1.5">
+                Media to Send from Every Source
+              </label>
+              <div className="flex items-center p-1 bg-slate-100 rounded-lg border border-slate-200 w-fit max-w-full">
+                {([
+                  ['video', 'Video', Video],
+                  ['music', 'Music', Music2],
+                  ['both', 'Both', Layers2],
+                ] as const).map(([mode, label, Icon]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setMediaMode(mode)}
+                    aria-pressed={mediaMode === mode}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                      mediaMode === mode
+                        ? 'bg-white text-slate-900 shadow-xs'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
 

@@ -5,6 +5,7 @@ import { openZeroDiskStream, type OpenedZeroDiskStream } from './streamer.ts';
 import { telemetry } from './telemetry.ts';
 import type {
   BotConfig,
+  BotMediaMode,
   BotStatusSnapshot,
   MediaAsset,
   ParsedMediaUrl,
@@ -14,25 +15,45 @@ import { extractSupportedUrlsFromText } from './urlRouter.ts';
 
 const DEFAULT_API_ROOT = 'https://api.telegram.org';
 
+interface ChatMediaOptions {
+  video: boolean;
+  music: boolean;
+}
+
+export function buildMediaOptionsKeyboard(options: ChatMediaOptions): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(`${options.video ? '☑' : '☐'} Video`, 'mediaopt:video')
+    .text(`${options.music ? '☑' : '☐'} Sound`, 'mediaopt:music');
+}
+
 class AsyncSemaphore {
   private active = 0;
   private queue: Array<() => void> = [];
   private limit: number;
+  private maxQueued: number;
 
   constructor(limit: number) {
     this.limit = Math.max(1, limit);
+    this.maxQueued = Math.max(16, this.limit * 4);
   }
 
   setLimit(limit: number): void {
     this.limit = Math.max(1, limit);
+    this.maxQueued = Math.max(16, this.limit * 4);
     this.drain();
   }
 
   async run<T>(task: () => Promise<T>): Promise<T> {
-    if (this.active >= this.limit) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
-    }
-    this.active += 1;
+    await new Promise<void>((resolve, reject) => {
+      if (this.active < this.limit) {
+        this.active += 1;
+        resolve();
+      } else if (this.queue.length < this.maxQueued) {
+        this.queue.push(resolve);
+      } else {
+        reject(new Error('Bot worker queue is full. Try again shortly.'));
+      }
+    });
     telemetry.incrementActiveWorkers();
     try {
       return await task();
@@ -46,6 +67,7 @@ class AsyncSemaphore {
   private drain(): void {
     while (this.active < this.limit && this.queue.length > 0) {
       const next = this.queue.shift();
+      this.active += 1;
       next?.();
     }
   }
@@ -62,12 +84,14 @@ class TelegramBotManager {
     Number(process.env.BOT_CONCURRENCY || 8)
   );
   private chatQualityPrefs = new Map<number, YouTubeQuality>();
+  private chatMediaPrefs = new Map<number, ChatMediaOptions>();
 
   private config: BotConfig = {
     token: process.env.TELEGRAM_BOT_TOKEN?.trim() || '',
     apiRoot: process.env.TELEGRAM_API_ROOT?.trim() || DEFAULT_API_ROOT,
     concurrency: Number(process.env.BOT_CONCURRENCY || 8),
     youtubeQuality: '720',
+    mediaMode: 'both',
     autoCompressOverLimit: false,
     proxyUrl: '',
     cookiesHeader: '',
@@ -80,6 +104,25 @@ class TelegramBotManager {
     return isLocalApi ? 2000 * 1024 * 1024 : 50 * 1024 * 1024;
   }
 
+  private getChatMediaOptions(chatId: number): ChatMediaOptions {
+    const saved = this.chatMediaPrefs.get(chatId);
+    if (saved) return saved;
+    return {
+      video: this.config.mediaMode !== 'music',
+      music: this.config.mediaMode !== 'video',
+    };
+  }
+
+  private saveChatMediaOptions(chatId: number, options: ChatMediaOptions): void {
+    this.chatMediaPrefs.delete(chatId);
+    this.chatMediaPrefs.set(chatId, options);
+    while (this.chatMediaPrefs.size > 2000) {
+      const oldestChatId = this.chatMediaPrefs.keys().next().value;
+      if (oldestChatId === undefined) break;
+      this.chatMediaPrefs.delete(oldestChatId);
+    }
+  }
+
   getStatus(): BotStatusSnapshot {
     const limitMb = Math.round(this.getLimitBytes() / (1024 * 1024));
     return {
@@ -90,6 +133,7 @@ class TelegramBotManager {
       limitMb,
       concurrency: this.config.concurrency,
       youtubeQuality: this.config.youtubeQuality,
+      mediaMode: this.config.mediaMode,
       autoCompressOverLimit: this.config.autoCompressOverLimit,
       hasToken: Boolean(this.config.token),
       hasProxy: Boolean(this.config.proxyUrl),
@@ -120,6 +164,13 @@ class TelegramBotManager {
       partial.youtubeQuality === '1080'
     ) {
       this.config.youtubeQuality = partial.youtubeQuality;
+    }
+    if (
+      partial.mediaMode === 'video' ||
+      partial.mediaMode === 'music' ||
+      partial.mediaMode === 'both'
+    ) {
+      this.config.mediaMode = partial.mediaMode as BotMediaMode;
     }
     if (typeof partial.autoCompressOverLimit === 'boolean') {
       this.config.autoCompressOverLimit = partial.autoCompressOverLimit;
@@ -221,13 +272,14 @@ class TelegramBotManager {
     bot.command('start', async (ctx) => {
       await ctx.reply(
         [
-          'Send any media link from Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, or YouTube Shorts.',
+          'Send any media link from Instagram, TikTok, Twitter/X, Reddit, Tumblr, YouTube, YouTube Shorts, or YouTube Music.',
           '',
           'All media is streamed directly to Telegram in memory with zero disk storage.',
-          'TikTok links automatically include the extracted MP3 audio track.',
+          'Use /options to choose video, sound, both, or neither for links in this chat.',
           '',
           'Commands:',
           '/quality — Choose preferred YouTube stream resolution (360p / 720p / 1080p)',
+          '/options — Choose video and sound with checkboxes',
           '/help — Supported platforms & limits',
         ].join('\n')
       );
@@ -238,12 +290,14 @@ class TelegramBotManager {
       await ctx.reply(
         [
           'Supported Platforms:',
-          '• Instagram (Posts, Reels, Stories, Carousels)',
+          '• Instagram (Posts, Reels, Stories, Carousels + MP3 audio for videos)',
           '• TikTok (Videos, Slideshows + separate MP3 audio)',
           '• Twitter / X (Videos, GIFs, Multi-image Tweets)',
           '• Reddit (Videos with audio muxing, Images, GIFs, Galleries)',
           '• Tumblr (Videos, Images, GIFs)',
-          '• YouTube & YouTube Shorts',
+          '• YouTube & YouTube Shorts (Video + extracted MP3 audio)',
+          '• YouTube Music (MP3 audio tracks & playlists)',
+          'Use /options to choose video and sound independently for each chat.',
           '',
           `Active upload limit: ${limitMb} MB`,
         ].join('\n')
@@ -259,6 +313,32 @@ class TelegramBotManager {
         .text(current === '1080' ? '✓ 1080p' : '1080p', 'ytq:1080');
       await ctx.reply(`Current YouTube quality: ${current}p. Select target resolution:`, {
         reply_markup: kb,
+      });
+    });
+
+    bot.command('options', async (ctx) => {
+      const options = this.getChatMediaOptions(ctx.chat.id);
+      await ctx.reply('Choose what to send for links in this chat:', {
+        reply_markup: buildMediaOptionsKeyboard(options),
+      });
+    });
+
+    bot.callbackQuery(/^mediaopt:(video|music)$/, async (ctx) => {
+      if (!ctx.chat) {
+        await ctx.answerCallbackQuery({ text: 'Open /options in a chat first.' });
+        return;
+      }
+      const options = this.getChatMediaOptions(ctx.chat.id);
+      const option = ctx.match[1] as keyof ChatMediaOptions;
+      options[option] = !options[option];
+      this.saveChatMediaOptions(ctx.chat.id, options);
+      const selection = [
+        options.video ? 'video' : undefined,
+        options.music ? 'sound' : undefined,
+      ].filter(Boolean).join(' + ') || 'nothing';
+      await ctx.answerCallbackQuery({ text: `Selected: ${selection}` });
+      await ctx.editMessageReplyMarkup({
+        reply_markup: buildMediaOptionsKeyboard(options),
       });
     });
 
@@ -295,9 +375,15 @@ class TelegramBotManager {
     const startedAt = Date.now();
     let statusMsgId: number | null = null;
     const isLongFormYt = parsedUrl.platform === 'youtube';
+    const mediaOptions = this.getChatMediaOptions(chatId);
 
     try {
-      await bot.api.sendChatAction(chatId, 'upload_video').catch(() => {});
+      await bot.api
+        .sendChatAction(
+          chatId,
+          parsedUrl.platform === 'youtube_music' ? 'record_voice' : 'upload_video'
+        )
+        .catch(() => {});
       if (isLongFormYt) {
         const statusMsg = await bot.api.sendMessage(
           chatId,
@@ -318,6 +404,34 @@ class TelegramBotManager {
         cookiesHeader: this.config.cookiesHeader,
       });
 
+      const selectedAssets = extraction.assets.filter(
+        (asset) =>
+          (mediaOptions.music && asset.kind === 'audio') ||
+          (mediaOptions.video && asset.kind !== 'audio')
+      );
+
+      if (selectedAssets.length === 0) {
+        if (statusMsgId) {
+          await bot.api.deleteMessage(chatId, statusMsgId).catch(() => {});
+        }
+        await bot.api.sendMessage(
+          chatId,
+          mediaOptions.video || mediaOptions.music
+            ? `No ${mediaOptions.music && !mediaOptions.video ? 'sound' : 'video'} media was found for this link.`
+            : 'Both video and sound are turned off. Use /options to select at least one.',
+          { reply_parameters: { message_id: replyToMessageId } }
+        );
+        telemetry.logEvent({
+          source: 'telegram',
+          level: 'info',
+          platform: parsedUrl.platform,
+          chatLabel,
+          message: `No selected media assets available for this link`,
+          durationMs: Date.now() - startedAt,
+        });
+        return;
+      }
+
       if (statusMsgId) {
         await bot.api
           .editMessageText(
@@ -328,37 +442,46 @@ class TelegramBotManager {
           .catch(() => {});
       }
 
-      const visualAssets = extraction.assets.filter((a) => a.kind !== 'audio');
-      const audioAssets = extraction.assets.filter((a) => a.kind === 'audio');
+      const visualAssets = selectedAssets.filter((a) => a.kind !== 'audio');
+      const audioAssets = selectedAssets.filter((a) => a.kind === 'audio');
 
-      let totalBytes = 0;
+      const sendVisuals = async (): Promise<number> => {
+        if (visualAssets.length > 1) {
+          return this.sendVisualMediaGroup(
+            bot,
+            chatId,
+            replyToMessageId,
+            visualAssets
+          );
+        }
+        if (visualAssets.length === 1) {
+          return this.sendSingleAsset(
+            bot,
+            chatId,
+            replyToMessageId,
+            visualAssets[0]
+          );
+        }
+        return 0;
+      };
 
-      if (visualAssets.length > 1) {
-        totalBytes += await this.sendVisualMediaGroup(
-          bot,
-          chatId,
-          replyToMessageId,
-          visualAssets
-        );
-      } else if (visualAssets.length === 1) {
-        totalBytes += await this.sendSingleAsset(
-          bot,
-          chatId,
-          replyToMessageId,
-          visualAssets[0]
-        );
-      }
-
-      // TikTok audio extraction stream
-      for (const audioAsset of audioAssets) {
+      const sendAudios = async (): Promise<number> => {
+        if (audioAssets.length === 0) return 0;
         await bot.api.sendChatAction(chatId, 'record_voice').catch(() => {});
-        totalBytes += await this.sendSingleAsset(
-          bot,
-          chatId,
-          replyToMessageId,
-          audioAsset
+        const audioTotals = await Promise.all(
+          audioAssets.map((audioAsset) =>
+            this.sendSingleAsset(bot, chatId, replyToMessageId, audioAsset)
+          )
         );
-      }
+        return audioTotals.reduce((acc, n) => acc + n, 0);
+      };
+
+      // Stream visuals and extracted MP3 audio concurrently for faster TikTok/YouTube/Instagram delivery
+      const [visualBytes, audioBytes] = await Promise.all([
+        sendVisuals(),
+        sendAudios(),
+      ]);
+      const totalBytes = visualBytes + audioBytes;
 
       if (statusMsgId) {
         await bot.api.deleteMessage(chatId, statusMsgId).catch(() => {});
@@ -369,7 +492,7 @@ class TelegramBotManager {
         level: 'success',
         platform: parsedUrl.platform,
         chatLabel,
-        message: `Streamed ${extraction.assets.length} asset(s) via ${extraction.extractorUsed}`,
+        message: `Streamed ${selectedAssets.length} asset(s) via ${extraction.extractorUsed}`,
         bytesStreamed: totalBytes,
         durationMs: Date.now() - startedAt,
       });
@@ -527,14 +650,20 @@ class TelegramBotManager {
           reply_parameters: { message_id: replyToMessageId },
         });
       } else if (asset.kind === 'audio') {
-        await bot.api.sendAudio(chatId, inputFile, {
-          title: asset.title,
-          performer: asset.author,
-          duration: asset.durationSeconds
-            ? Math.round(asset.durationSeconds)
-            : undefined,
-          reply_parameters: { message_id: replyToMessageId },
-        });
+        if (asset.ext === 'mp3' || asset.ext === 'm4a') {
+          await bot.api.sendAudio(chatId, inputFile, {
+            title: asset.title,
+            performer: asset.author,
+            duration: asset.durationSeconds
+              ? Math.round(asset.durationSeconds)
+              : undefined,
+            reply_parameters: { message_id: replyToMessageId },
+          });
+        } else {
+          await bot.api.sendDocument(chatId, inputFile, {
+            reply_parameters: { message_id: replyToMessageId },
+          });
+        }
       } else {
         await bot.api.sendVideo(chatId, inputFile, {
           supports_streaming: true,

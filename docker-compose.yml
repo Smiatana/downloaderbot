@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     container_name: streambot
     restart: unless-stopped
+    init: true
+    mem_limit: 768m
+    cpus: 2.0
+    pids_limit: 128
     ports:
       - "${PORT:-3000}:3000"
     environment:
@@ -15,6 +19,10 @@ services:
       TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
       TELEGRAM_API_ROOT: "${TELEGRAM_API_ROOT:-https://api.telegram.org}"
       BOT_CONCURRENCY: "${BOT_CONCURRENCY:-8}"
+      MAX_EXTRACT_CONCURRENCY: "${MAX_EXTRACT_CONCURRENCY:-3}"
+      MAX_STREAM_CONCURRENCY: "${MAX_STREAM_CONCURRENCY:-6}"
+      TRUST_PROXY_HOPS: "${TRUST_PROXY_HOPS:-0}"
+      NODE_OPTIONS: "--max-old-space-size=512"
 
   # Optional: Uncomment below if you need >50 MB uploads (up to 2000 MB).
   # Requires TELEGRAM_API_ID and TELEGRAM_API_HASH from https://my.telegram.org

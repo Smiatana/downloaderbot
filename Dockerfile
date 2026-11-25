@@ -6,14 +6,14 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-RUN mkdir -p /app/bin && \
-    curl -fsSL -o /app/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && \
-    chmod +x /app/bin/yt-dlp
-
 COPY package*.json ./
 RUN npm ci
 
 COPY . .
+
+RUN mkdir -p /app/bin && \
+  curl -fsSL -o /app/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && \
+  chmod +x /app/bin/yt-dlp
 
 RUN npm run build && npm prune --omit=dev
 

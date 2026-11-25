@@ -5,7 +5,8 @@ export type PlatformId =
   | 'reddit'
   | 'tumblr'
   | 'youtube'
-  | 'youtube_shorts';
+  | 'youtube_shorts'
+  | 'youtube_music';
 
 export type MediaKind = 'video' | 'photo' | 'animation' | 'audio';
 
@@ -17,6 +18,7 @@ export type StreamStrategy =
   | 'ytdlp_stdout';
 
 export type YouTubeQuality = '360' | '720' | '1080';
+export type BotMediaMode = 'video' | 'music' | 'both';
 
 export interface ParsedMediaUrl {
   platform: PlatformId;
@@ -34,6 +36,7 @@ export interface MediaAsset {
   sourceUrl: string;
   streamUrl: string;
   audioStreamUrl?: string;
+  audioExt?: string;
   thumbnailUrl?: string;
   filename: string;
   mimeType: string;
@@ -74,6 +77,7 @@ export interface BotConfig {
   apiRoot: string;
   concurrency: number;
   youtubeQuality: YouTubeQuality;
+  mediaMode: BotMediaMode;
   autoCompressOverLimit: boolean;
   proxyUrl: string;
   cookiesHeader: string;
@@ -87,6 +91,7 @@ export interface BotStatusSnapshot {
   limitMb: number;
   concurrency: number;
   youtubeQuality: YouTubeQuality;
+  mediaMode: BotMediaMode;
   autoCompressOverLimit: boolean;
   hasToken: boolean;
   hasProxy: boolean;
