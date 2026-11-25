@@ -15,6 +15,14 @@ import { extractSupportedUrlsFromText } from './urlRouter.ts';
 
 const DEFAULT_API_ROOT = 'https://api.telegram.org';
 
+function safeFailureDetail(message: string): string {
+  return message
+    .replace(/\b(cookie|authorization)\s*[:=]\s*[^\r\n]*/gi, '$1=[redacted]')
+    .replace(/https?:\/\/[^\s"'<>]+/gi, '[URL]')
+    .replace(/\s+/g, ' ')
+    .slice(0, 360);
+}
+
 interface ChatMediaOptions {
   video: boolean;
   music: boolean;
@@ -504,6 +512,7 @@ class TelegramBotManager {
         await bot.api.deleteMessage(chatId, statusMsgId).catch(() => {});
       }
       const errMsg = err instanceof Error ? err.message : String(err);
+      const safeDetail = safeFailureDetail(errMsg);
       telemetry.logEvent({
         source: 'telegram',
         level: 'error',
@@ -515,7 +524,7 @@ class TelegramBotManager {
       await bot.api
         .sendMessage(
           chatId,
-          "❌ Sorry, I couldn't extract media from this link. It might be private or deleted.",
+          `❌ Media failed during ${failureStage}.${safeDetail ? ` Reason: ${safeDetail}` : ''}`,
           { reply_parameters: { message_id: replyToMessageId } }
         )
         .catch(() => {});
