@@ -82,7 +82,7 @@ not compatible even on an `aarch64` phone. Install the Termux-native Python
 package and its YouTube JavaScript support instead:
 
 ```bash
-pkg update
+pkg update && pkg upgrade
 pkg install nodejs-lts python-yt-dlp yt-dlp-ejs ffmpeg
 npm ci
 npm run dev

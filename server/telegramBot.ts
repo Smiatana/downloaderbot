@@ -374,6 +374,7 @@ class TelegramBotManager {
   ): Promise<void> {
     const startedAt = Date.now();
     let statusMsgId: number | null = null;
+    let failureStage = 'Telegram preflight';
     const isLongFormYt = parsedUrl.platform === 'youtube';
     const mediaOptions = this.getChatMediaOptions(chatId);
 
@@ -397,12 +398,14 @@ class TelegramBotManager {
       const quality =
         this.chatQualityPrefs.get(chatId) ?? this.config.youtubeQuality;
 
+      failureStage = 'yt-dlp metadata extraction';
       const extraction = await extractMedia(parsedUrl, {
         youtubeQuality: quality,
         maxLimitBytes,
         proxyUrl: this.config.proxyUrl,
         cookiesHeader: this.config.cookiesHeader,
       });
+      failureStage = 'media streaming or Telegram upload';
 
       const selectedAssets = extraction.assets.filter(
         (asset) =>
@@ -506,7 +509,7 @@ class TelegramBotManager {
         level: 'error',
         platform: parsedUrl.platform,
         chatLabel,
-        message: errMsg,
+        message: `${failureStage}: ${errMsg}`,
         durationMs: Date.now() - startedAt,
       });
       await bot.api
