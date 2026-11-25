@@ -61,6 +61,94 @@ function attachByteMeter(
   return meter;
 }
 
+export function assertReadableHasData(
+  source: Readable,
+  timeoutMs = 15_000
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      source.off('data', onData);
+      source.off('end', onEnd);
+      source.off('error', onError);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onData = (chunk: Buffer) => {
+      source.pause();
+      try {
+        source.unshift(chunk);
+        finish();
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+    const onEnd = () => finish(new Error('Media source ended without sending data.'));
+    const onError = (error: Error) => finish(error);
+    const timer = setTimeout(
+      () => finish(new Error('Timed out waiting for the first media bytes.')),
+      timeoutMs
+    );
+
+    source.once('data', onData);
+    source.once('end', onEnd);
+    source.once('error', onError);
+  });
+}
+
+async function openYtDlpAudioFallback(
+  asset: MediaAsset,
+  onComplete?: (totalBytes: number, durationMs: number) => void
+): Promise<OpenedZeroDiskStream> {
+  const { ensureYtDlpBinary } = await import('./extractor.ts');
+  const ytDlpBin = await ensureYtDlpBinary();
+  const proc = spawn(
+    ytDlpBin,
+    [
+      '-f',
+      'bestaudio/best',
+      '--js-runtimes',
+      'node',
+      '--no-warnings',
+      '-o',
+      '-',
+      asset.sourceUrl,
+    ],
+    { shell: false, stdio: ['ignore', 'pipe', 'pipe'] }
+  );
+  let stderrMsg = '';
+  proc.stderr.on('data', (chunk: Buffer) => {
+    stderrMsg = appendStderr(stderrMsg, chunk);
+  });
+  proc.on('error', (err) => proc.stdout.destroy(err));
+  proc.on('close', (code) => {
+    if (code && code !== 0 && !proc.stdout.destroyed) {
+      proc.stdout.destroy(
+        new Error(`yt-dlp audio fallback exited ${code}: ${stderrMsg.slice(-200)}`)
+      );
+    }
+  });
+
+  try {
+    await assertReadableHasData(proc.stdout);
+  } catch (error) {
+    if (!proc.killed) proc.kill('SIGKILL');
+    throw error;
+  }
+
+  return {
+    stream: attachByteMeter(proc.stdout, onComplete),
+    contentType: asset.mimeType,
+    filename: asset.filename,
+    cleanup: () => {
+      if (!proc.killed) proc.kill('SIGKILL');
+    },
+  };
+}
+
 function buildFfmpegHeadersArg(headers?: Record<string, string>): string {
   const merged: Record<string, string> = {
     'User-Agent': DEFAULT_USER_AGENT,
@@ -247,42 +335,7 @@ export async function openZeroDiskStream(
       }
 
       if (asset.kind === 'audio') {
-        const proc = spawn(
-          ytDlpBin,
-          [
-            '-f',
-            'bestaudio/best',
-            '--js-runtimes',
-            'node',
-            '--no-warnings',
-            '-o',
-            '-',
-            asset.sourceUrl,
-          ],
-          { shell: false, stdio: ['ignore', 'pipe', 'pipe'] }
-        );
-        let stderrMsg = '';
-        proc.stderr.on('data', (chunk: Buffer) => {
-          stderrMsg = appendStderr(stderrMsg, chunk);
-        });
-        proc.on('error', (err) => proc.stdout.destroy(err));
-        proc.on('close', (code) => {
-          if (code && code !== 0 && !proc.stdout.destroyed) {
-            proc.stdout.destroy(
-              new Error(`yt-dlp audio fallback exited ${code}: ${stderrMsg.slice(-200)}`)
-            );
-          }
-        });
-
-        const metered = attachByteMeter(proc.stdout, options.onComplete);
-        return {
-          stream: metered,
-          contentType: asset.mimeType,
-          filename: asset.filename,
-          cleanup: () => {
-            if (!proc.killed) proc.kill('SIGKILL');
-          },
-        };
+        return openYtDlpAudioFallback(asset, options.onComplete);
       }
 
       const proc = spawn(
@@ -333,6 +386,18 @@ export async function openZeroDiskStream(
     upstreamRes.body as unknown as WebReadableStream
   );
   const upstreamContentType = (upstreamRes.headers.get('content-type') || '').toLowerCase();
+
+  if (asset.kind === 'audio' && !shouldExtractMp3) {
+    try {
+      await assertReadableHasData(upstreamReadable);
+    } catch (error) {
+      upstreamReadable.destroy();
+      if (asset.sourceUrl) {
+        return openYtDlpAudioFallback(asset, options.onComplete);
+      }
+      throw error;
+    }
+  }
 
   // Strategy 2: On-the-fly MP3 extraction via FFmpeg pipe:0 -> pipe:1
   // Skip FFmpeg completely if the upstream response is already MP3 (zero-transcode pass-through)

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
 import JSZip from 'jszip';
+import { Readable } from 'node:stream';
 import {
   assertSafeUpstreamMediaUrl,
   extractSupportedUrlsFromText,
@@ -24,6 +25,7 @@ import {
   telegramBotManager,
 } from '../server/telegramBot.ts';
 import { telemetry } from '../server/telemetry.ts';
+import { assertReadableHasData } from '../server/streamer.ts';
 
 const LIMIT_50MB = 50 * 1024 * 1024;
 
@@ -100,6 +102,19 @@ test('Extractor: uses the Termux yt-dlp package path only in Termux', () => {
   assert.equal(getTermuxYtDlpPath(undefined, '0.118.0'),
     '/data/data/com.termux/files/usr/bin/yt-dlp');
   assert.equal(getTermuxYtDlpPath('/usr'), undefined);
+});
+
+test('Streamer: preflights first media bytes and rejects empty sources', async () => {
+  const nonEmpty = Readable.from([Buffer.from('media')]);
+  await assertReadableHasData(nonEmpty);
+  const chunks: Buffer[] = [];
+  for await (const chunk of nonEmpty) chunks.push(Buffer.from(chunk));
+  assert.equal(Buffer.concat(chunks).toString(), 'media');
+
+  await assert.rejects(
+    assertReadableHasData(Readable.from([])),
+    /ended without sending data/
+  );
 });
 
 test('URL Router: strips tracking params and preserves v/list/t on YouTube family', () => {
