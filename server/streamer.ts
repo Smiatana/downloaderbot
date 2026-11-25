@@ -135,8 +135,27 @@ async function openYtDlpAudioFallback(
   try {
     await assertReadableHasData(proc.stdout);
   } catch (error) {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          proc.off('close', onClose);
+          if (!proc.killed) proc.kill('SIGKILL');
+          resolve();
+        }, 1000);
+        const onClose = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        proc.once('close', onClose);
+      });
+    }
     if (!proc.killed) proc.kill('SIGKILL');
-    throw error;
+    const detail = stderrMsg.trim().slice(-1200);
+    throw new Error(
+      detail
+        ? `yt-dlp audio fallback produced no media bytes: ${detail}`
+        : `yt-dlp audio fallback produced no media bytes: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 
   return {
