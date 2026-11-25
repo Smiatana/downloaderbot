@@ -24,8 +24,52 @@ const YTDLP_PATH = path.join(BIN_DIR, 'yt-dlp');
 const TMP_BIN_DIR = path.join(os.tmpdir(), 'streambot-bin');
 const TMP_YTDLP_PATH = path.join(TMP_BIN_DIR, 'yt-dlp');
 const MIN_YTDLP_STANDALONE_BYTES = 15_000_000;
-const YTDLP_RELEASE_URL =
-  'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+const YTDLP_RELEASE_BASE_URL =
+  'https://github.com/yt-dlp/yt-dlp/releases/latest/download';
+
+export function getYtDlpReleaseUrl(arch: string): string {
+  const asset = arch === 'x64'
+    ? 'yt-dlp_linux'
+    : arch === 'arm64'
+      ? 'yt-dlp_linux_aarch64'
+      : undefined;
+  if (!asset) {
+    throw new Error(`yt-dlp standalone binary is not available for CPU architecture: ${arch}`);
+  }
+  return `${YTDLP_RELEASE_BASE_URL}/${asset}`;
+}
+
+function hasExpectedElfArchitecture(filePath: string): boolean {
+  const expectedMachine = process.arch === 'x64'
+    ? 62
+    : process.arch === 'arm64'
+      ? 183
+      : undefined;
+  if (process.platform !== 'linux' || expectedMachine === undefined) return false;
+
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(20);
+    if (fs.readSync(fd, header, 0, header.length, 0) !== header.length) return false;
+    if (
+      header[0] !== 0x7f ||
+      header[1] !== 0x45 ||
+      header[2] !== 0x4c ||
+      header[3] !== 0x46
+    ) return false;
+    const machine = header[5] === 1
+      ? header.readUInt16LE(18)
+      : header[5] === 2
+        ? header.readUInt16BE(18)
+        : undefined;
+    return machine === expectedMachine;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
 
 const metadataHttpAgent = new Agent({
   connections: 32,
@@ -45,7 +89,7 @@ function isValidExecutableYtDlp(filePath: string): boolean {
       return false;
     }
     fs.accessSync(filePath, fs.constants.X_OK);
-    return true;
+    return hasExpectedElfArchitecture(filePath);
   } catch {
     return false;
   }
@@ -72,7 +116,8 @@ export async function ensureYtDlpBinary(): Promise<string> {
 
   if (!ytDlpEnsurePromise) {
     ytDlpEnsurePromise = (async () => {
-      const res = await undiciFetch(YTDLP_RELEASE_URL, {
+      const releaseUrl = getYtDlpReleaseUrl(process.arch);
+      const res = await undiciFetch(releaseUrl, {
         dispatcher: metadataHttpAgent,
         redirect: 'follow',
       });

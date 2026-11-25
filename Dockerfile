@@ -11,9 +11,15 @@ RUN npm ci
 
 COPY . .
 
-RUN mkdir -p /app/bin && \
-  curl -fsSL -o /app/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && \
-  chmod +x /app/bin/yt-dlp
+RUN set -eu; \
+  case "$(dpkg --print-architecture)" in \
+    amd64) yt_dlp_asset=yt-dlp_linux ;; \
+    arm64) yt_dlp_asset=yt-dlp_linux_aarch64 ;; \
+    *) echo "Unsupported architecture for standalone yt-dlp: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+  esac; \
+  mkdir -p /app/bin; \
+  curl -fsSL -o /app/bin/yt-dlp "https://github.com/yt-dlp/yt-dlp/releases/latest/download/$yt_dlp_asset"; \
+  chmod 755 /app/bin/yt-dlp
 
 RUN npm run build && npm prune --omit=dev
 

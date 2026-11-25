@@ -11,6 +11,7 @@ import {
 import {
   buildAssetsFromTikWmData,
   buildAssetsFromYtDlpPayload,
+  getYtDlpReleaseUrl,
   parseTikTokHtmlPayload,
   pickBestAudioFormat,
   pickFormatsForEntry,
@@ -78,6 +79,18 @@ test('URL Router: recognizes all 8 supported platforms including YouTube Music',
     assert.ok(parsed, `Expected ${url} to parse`);
     assert.equal(parsed.platform, expectedPlatform, `Wrong platform for ${url}`);
   }
+});
+
+test('Extractor: selects a yt-dlp release matching x86_64 and ARM64', () => {
+  assert.equal(
+    getYtDlpReleaseUrl('x64'),
+    'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux'
+  );
+  assert.equal(
+    getYtDlpReleaseUrl('arm64'),
+    'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux_aarch64'
+  );
+  assert.throws(() => getYtDlpReleaseUrl('arm'), /not available for CPU architecture/);
 });
 
 test('URL Router: strips tracking params and preserves v/list/t on YouTube family', () => {
