@@ -28,6 +28,12 @@ export interface OpenedZeroDiskStream {
   cleanup: () => void;
 }
 
+export interface OpenedVideoAudioStreams {
+  video: Readable;
+  audio: Readable;
+  cleanup: () => void;
+}
+
 function attachByteMeter(
   source: Readable,
   onComplete?: (totalBytes: number, durationMs: number) => void
@@ -97,6 +103,60 @@ export function assertReadableHasData(
     source.once('end', onEnd);
     source.once('error', onError);
   });
+}
+
+export async function splitVideoStreamForAudio(
+  source: Readable,
+  metadata: { title?: string; author?: string } = {}
+): Promise<OpenedVideoAudioStreams> {
+  const video = new PassThrough({ highWaterMark: 256 * 1024 });
+  const proc = spawn(
+    'ffmpeg',
+    [
+      '-loglevel', 'error',
+      '-i', 'pipe:0',
+      '-vn', '-sn', '-dn',
+      '-c:a', 'libmp3lame',
+      '-q:a', '3',
+      '-compression_level', '2',
+      '-id3v2_version', '3',
+      ...(metadata.title ? ['-metadata', `title=${metadata.title.replace(/[\r\n]/g, ' ')}`] : []),
+      ...(metadata.author ? ['-metadata', `artist=${metadata.author.replace(/[\r\n]/g, ' ')}`] : []),
+      '-f', 'mp3', 'pipe:1',
+    ],
+    { shell: false, stdio: ['pipe', 'pipe', 'pipe'] }
+  );
+
+  let stderrMsg = '';
+  proc.stderr.on('data', (chunk: Buffer) => {
+    stderrMsg = appendStderr(stderrMsg, chunk);
+  });
+  proc.stdin.on('error', () => {});
+  source.on('error', (error) => {
+    video.destroy(error);
+    if (!proc.killed) proc.kill('SIGKILL');
+  });
+  source.pipe(video);
+  source.pipe(proc.stdin);
+  proc.on('error', (error) => proc.stdout.destroy(error));
+  proc.on('close', (code) => {
+    if (code && code !== 0 && !proc.stdout.destroyed) {
+      proc.stdout.destroy(
+        new Error(`FFmpeg audio extraction exited ${code}: ${stderrMsg.slice(-300)}`)
+      );
+    }
+  });
+
+  return {
+    video,
+    audio: proc.stdout,
+    cleanup: () => {
+      source.destroy();
+      video.destroy();
+      proc.stdout.destroy();
+      if (!proc.killed) proc.kill('SIGKILL');
+    },
+  };
 }
 
 async function openYtDlpAudioFallback(

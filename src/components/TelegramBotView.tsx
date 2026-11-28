@@ -200,7 +200,7 @@ export function TelegramBotView({
             ) : (
               <div className="flex items-center gap-2 text-xs font-medium text-slate-500">
                 <Square className="w-3.5 h-3.5" />
-                <span>Stopped</span>
+                <span>{botStatus.hasToken ? 'Stopped' : 'Token required'}</span>
               </div>
             )}
             <button
@@ -214,6 +214,14 @@ export function TelegramBotView({
             </button>
           </div>
         </div>
+
+        {!botStatus.running && (
+          <p className="text-xs text-slate-600 mt-4">
+            {botStatus.hasToken
+              ? 'Bot polling is stopped. Press Start Async Bot to connect it.'
+              : 'The web server is running, but Telegram is idle until you enter a bot token and press Start Async Bot.'}
+          </p>
+        )}
 
         <form onSubmit={handleStartBot} className="pt-5 space-y-5">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">

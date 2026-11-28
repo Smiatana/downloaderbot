@@ -1,7 +1,11 @@
 import { Bot, InlineKeyboard, InputFile } from 'grammy';
 import type { InputMediaPhoto, InputMediaVideo } from 'grammy/types';
 import { extractMedia } from './extractor.ts';
-import { openZeroDiskStream, type OpenedZeroDiskStream } from './streamer.ts';
+import {
+  openZeroDiskStream,
+  splitVideoStreamForAudio,
+  type OpenedZeroDiskStream,
+} from './streamer.ts';
 import { telemetry } from './telemetry.ts';
 import type {
   BotConfig,
@@ -14,6 +18,19 @@ import type {
 import { extractSupportedUrlsFromText } from './urlRouter.ts';
 
 const DEFAULT_API_ROOT = 'https://api.telegram.org';
+
+function getErrorDetails(error: unknown): string {
+  const details: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    const message = current instanceof Error ? current.message : String(current);
+    if (message && !details.includes(message)) details.push(message);
+    current = current instanceof Error
+      ? current.cause
+      : (current as { cause?: unknown }).cause;
+  }
+  return details.join(' caused by ');
+}
 
 function safeFailureDetail(message: string): string {
   return message
@@ -221,6 +238,7 @@ class TelegramBotManager {
     bot.catch((err) => {
       const msg = err.error instanceof Error ? err.error.message : String(err.error);
       this.lastError = msg;
+      console.error(`Telegram bot handler failed: ${msg}`);
       telemetry.logEvent({
         source: 'telegram',
         level: 'error',
@@ -231,16 +249,24 @@ class TelegramBotManager {
     this.bot = bot;
     this.running = true;
     this.startedAt = Date.now();
+    console.info(`Starting Telegram long polling for @${me.username ?? 'unknown'}.`);
 
     // Start async long polling without awaiting forever
     bot
       .start({
-        drop_pending_updates: true,
         allowed_updates: ['message', 'callback_query'],
+        onStart: (botInfo) => {
+          this.running = true;
+          this.startedAt = Date.now();
+          console.info(
+            `Telegram long polling is ready for @${botInfo.username ?? 'unknown'}; waiting for updates.`
+          );
+        },
       })
       .catch((err) => {
         this.running = false;
         this.lastError = err instanceof Error ? err.message : String(err);
+        console.error(`Telegram long polling stopped: ${this.lastError}`);
         telemetry.logEvent({
           source: 'telegram',
           level: 'error',
@@ -253,6 +279,9 @@ class TelegramBotManager {
       level: 'success',
       message: `Connected @${me.username} (async zero-disk mode, concurrency ${this.config.concurrency}, limit ${Math.round(this.getLimitBytes() / 1048576)} MB)`,
     });
+    console.info(
+      `Telegram bot @${me.username ?? 'unknown'} initialized; long polling requested (concurrency ${this.config.concurrency}).`
+    );
 
     return this.getStatus();
   }
@@ -268,6 +297,7 @@ class TelegramBotManager {
     this.bot = null;
     this.running = false;
     this.startedAt = null;
+    console.info('Telegram bot polling stopped.');
     telemetry.logEvent({
       source: 'system',
       level: 'info',
@@ -277,6 +307,18 @@ class TelegramBotManager {
   }
 
   private registerHandlers(bot: Bot): void {
+    bot.use(async (ctx, next) => {
+      const updateType = ctx.update.message
+        ? `message:${ctx.update.message.chat.type}`
+        : ctx.update.callback_query
+          ? 'callback_query'
+          : ctx.update.inline_query
+            ? 'inline_query'
+            : 'other';
+      console.info(`Telegram update received (${updateType}).`);
+      await next();
+    });
+
     bot.command('start', async (ctx) => {
       await ctx.reply(
         [
@@ -487,11 +529,23 @@ class TelegramBotManager {
         return audioTotals.reduce((acc, n) => acc + n, 0);
       };
 
-      // Stream visuals and extracted MP3 audio concurrently for faster TikTok/YouTube/Instagram delivery
-      const [visualBytes, audioBytes] = await Promise.all([
-        sendVisuals(),
-        sendAudios(),
-      ]);
+      const youtubeVideoAudio =
+        (parsedUrl.platform === 'youtube' || parsedUrl.platform === 'youtube_shorts') &&
+        mediaOptions.video &&
+        mediaOptions.music &&
+        visualAssets.length === 1 &&
+        audioAssets.length > 0;
+      const [visualBytes, audioBytes] = youtubeVideoAudio
+        ? [
+            await this.sendYoutubeVideoAndExtractAudio(
+              bot,
+              chatId,
+              replyToMessageId,
+              visualAssets[0]
+            ),
+            0,
+          ]
+        : await Promise.all([sendVisuals(), sendAudios()]);
       const totalBytes = visualBytes + audioBytes;
 
       if (statusMsgId) {
@@ -511,14 +565,14 @@ class TelegramBotManager {
       if (statusMsgId) {
         await bot.api.deleteMessage(chatId, statusMsgId).catch(() => {});
       }
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = getErrorDetails(err);
       const safeDetail = safeFailureDetail(errMsg);
       telemetry.logEvent({
         source: 'telegram',
         level: 'error',
         platform: parsedUrl.platform,
         chatLabel,
-        message: `${failureStage}: ${errMsg}`,
+        message: `${failureStage}: ${safeDetail}`,
         durationMs: Date.now() - startedAt,
       });
       await bot.api
@@ -529,6 +583,65 @@ class TelegramBotManager {
         )
         .catch(() => {});
     }
+  }
+
+  private async sendYoutubeVideoAndExtractAudio(
+    bot: Bot,
+    chatId: number,
+    replyToMessageId: number,
+    asset: MediaAsset
+  ): Promise<number> {
+    if (asset.exceedsLimit && !this.config.autoCompressOverLimit) {
+      await this.sendSingleAsset(bot, chatId, replyToMessageId, asset);
+      return 0;
+    }
+
+    let bytesDelivered = 0;
+    const opened = await openZeroDiskStream(asset, {
+      compressOverLimit: this.config.autoCompressOverLimit,
+      onComplete: (bytes) => {
+        bytesDelivered = bytes;
+      },
+    });
+    let split: Awaited<ReturnType<typeof splitVideoStreamForAudio>> | undefined;
+    try {
+      split = await splitVideoStreamForAudio(opened.stream, {
+        title: asset.title,
+        author: asset.author,
+      });
+      const audioFilename = asset.filename.replace(/\.[^.]+$/, '_audio.mp3');
+      await Promise.all([
+        bot.api.sendVideo(
+          chatId,
+          new InputFile(split.video, opened.filename),
+          {
+            supports_streaming: true,
+            width: asset.width,
+            height: asset.height,
+            duration: asset.durationSeconds
+              ? Math.round(asset.durationSeconds)
+              : undefined,
+            reply_parameters: { message_id: replyToMessageId },
+          }
+        ),
+        bot.api.sendAudio(
+          chatId,
+          new InputFile(split.audio, audioFilename),
+          {
+            title: `${asset.title} (Audio)`,
+            performer: asset.author,
+            duration: asset.durationSeconds
+              ? Math.round(asset.durationSeconds)
+              : undefined,
+            reply_parameters: { message_id: replyToMessageId },
+          }
+        ),
+      ]);
+    } finally {
+      split?.cleanup();
+      opened.cleanup();
+    }
+    return bytesDelivered;
   }
 
   private async sendVisualMediaGroup(

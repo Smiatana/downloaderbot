@@ -41,13 +41,17 @@ const PLATFORM_DOMAIN_RULES: Array<{
       host === 'instagram.com' ||
       host.endsWith('.instagram.com') ||
       host === 'instagr.am' ||
-      host.endsWith('.instagr.am'),
+      host.endsWith('.instagr.am') ||
+      host === 'kkinstagram.com' ||
+      host.endsWith('.kkinstagram.com'),
   },
   {
     platform: 'tiktok',
     match: (host) =>
       host === 'tiktok.com' ||
-      host.endsWith('.tiktok.com'),
+      host.endsWith('.tiktok.com') ||
+      host === 'vxtiktok.com' ||
+      host.endsWith('.vxtiktok.com'),
   },
   {
     platform: 'twitter',
@@ -122,12 +126,23 @@ export function sanitizeAndParseUrl(rawInput: string): ParsedMediaUrl | null {
     'utm_content',
     'igsh',
     'igshid',
+    'fqnt',
     'fbclid',
     'si',
     's',
     't',
   ];
   const cleanUrlObj = new URL(parsed.toString());
+  const tiktokShortPath = cleanUrlObj.pathname.match(/^\/([A-Za-z0-9_-]{6,})\/?$/);
+  if (
+    hostname === 'vxtiktok.com' ||
+    (hostname === 'tiktok.com' && tiktokShortPath)
+  ) {
+    cleanUrlObj.hostname = 'vm.tiktok.com';
+    if (tiktokShortPath) cleanUrlObj.pathname = `/${tiktokShortPath[1]}/`;
+  } else if (hostname === 'kkinstagram.com') {
+    cleanUrlObj.hostname = 'www.instagram.com';
+  }
   const isYouTubeFamily =
     rule.platform === 'youtube' ||
     rule.platform === 'youtube_shorts' ||

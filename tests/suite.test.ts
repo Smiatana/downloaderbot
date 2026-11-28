@@ -25,7 +25,10 @@ import {
   telegramBotManager,
 } from '../server/telegramBot.ts';
 import { telemetry } from '../server/telemetry.ts';
-import { assertReadableHasData } from '../server/streamer.ts';
+import {
+  assertReadableHasData,
+  splitVideoStreamForAudio,
+} from '../server/streamer.ts';
 
 const LIMIT_50MB = 50 * 1024 * 1024;
 
@@ -60,7 +63,11 @@ test('URL Router: recognizes all 8 supported platforms including YouTube Music',
   const cases: Array<[string, string]> = [
     ['https://www.instagram.com/reel/Cx123456789/?igsh=abc', 'instagram'],
     ['https://instagr.am/p/AbCdEf123/', 'instagram'],
+    ['https://instagram.com/reel/DecFYMOo8gG/?fqnt=MWl5b3BpbHR6Mncwaw==', 'instagram'],
+    ['https://kkinstagram.com/reel/DecFYMOo8gG/?fqnt=MWl5b3BpbHR6Mncwaw==', 'instagram'],
     ['https://www.tiktok.com/@creator/video/7123456789012345678', 'tiktok'],
+    ['https://tiktok.com/ZSsSGLrxd/', 'tiktok'],
+    ['https://vxtiktok.com/ZSsSGLrxd/', 'tiktok'],
     ['https://vm.tiktok.com/ZM123456/', 'tiktok'],
     ['https://vt.tiktok.com/ZS123456/', 'tiktok'],
     ['https://twitter.com/nasa/status/123456789', 'twitter'],
@@ -82,6 +89,19 @@ test('URL Router: recognizes all 8 supported platforms including YouTube Music',
     assert.ok(parsed, `Expected ${url} to parse`);
     assert.equal(parsed.platform, expectedPlatform, `Wrong platform for ${url}`);
   }
+
+  assert.equal(
+    sanitizeAndParseUrl('https://vxtiktok.com/ZSsSGLrxd/')?.normalizedUrl,
+    'https://vm.tiktok.com/ZSsSGLrxd/'
+  );
+  assert.equal(
+    sanitizeAndParseUrl('https://tiktok.com/ZSsSGLrxd/')?.normalizedUrl,
+    'https://vm.tiktok.com/ZSsSGLrxd/'
+  );
+  assert.equal(
+    sanitizeAndParseUrl('https://kkinstagram.com/reel/DecFYMOo8gG/?fqnt=MWl5b3BpbHR6Mncwaw==')?.normalizedUrl,
+    'https://www.instagram.com/reel/DecFYMOo8gG/'
+  );
 });
 
 test('Extractor: selects a yt-dlp release matching x86_64 and ARM64', () => {
@@ -578,6 +598,31 @@ test('FFmpeg Zero-Disk Pipelines: MP3 extraction with ID3 tags & fragmented MP4 
   assert.equal(mp3Buffer.subarray(0, 3).toString('ascii'), 'ID3');
   assert.ok(mp3Buffer.includes(Buffer.from('Test Song')));
   assert.ok(mp3Buffer.includes(Buffer.from('Test Artist')));
+
+  const split = await splitVideoStreamForAudio(Readable.from([mp4Buffer]), {
+    title: 'Tee Test',
+    author: 'Test Artist',
+  });
+  try {
+    const [videoBytes, audioBytes] = await Promise.all([
+      (async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of split.video) chunks.push(Buffer.from(chunk));
+        return Buffer.concat(chunks);
+      })(),
+      (async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of split.audio) chunks.push(Buffer.from(chunk));
+        return Buffer.concat(chunks);
+      })(),
+    ]);
+    assert.ok(videoBytes.length > 1000, 'Tee video stream should remain non-empty');
+    assert.ok(audioBytes.length > 1000, 'Tee audio stream should remain non-empty');
+    assert.equal(audioBytes.subarray(0, 3).toString('ascii'), 'ID3');
+    assert.ok(audioBytes.includes(Buffer.from('Tee Test')));
+  } finally {
+    split.cleanup();
+  }
 });
 
 test('Python Export Generator: produces valid Python syntax with all new features', async () => {

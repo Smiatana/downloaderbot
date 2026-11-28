@@ -1882,6 +1882,7 @@ async function extractInstagramFallback(
               : USER_AGENT,
         },
         redirect: 'follow',
+        signal: AbortSignal.timeout(8_000),
         dispatcher: metadataHttpAgent,
       });
       if (!res.ok) continue;
@@ -1929,6 +1930,7 @@ async function extractInstagramFallback(
           exceedsLimit: typeof est === 'number' && est > maxLimitBytes,
           limitBytes: maxLimitBytes,
           strategy: 'direct_http',
+          headers: { Referer: 'https://www.instagram.com/' },
         });
 
         // Also extract Instagram video sound as MP3 music
@@ -1939,6 +1941,7 @@ async function extractInstagramFallback(
             sourceUrl: parsedUrl.normalizedUrl,
             streamUrl: raw,
             limitBytes: maxLimitBytes,
+            headers: { Referer: 'https://www.instagram.com/' },
             strategy: 'ffmpeg_extract_mp3',
             filenameBase: `ig_${shortcode}_${videoIdx}_audio`,
           })
@@ -1963,6 +1966,7 @@ async function extractInstagramFallback(
             filename: sanitizeFilename(`ig_${shortcode}_${assets.length + 1}`, 'jpg'),
             mimeType: 'image/jpeg',
             ext: 'jpg',
+            headers: { Referer: 'https://www.instagram.com/' },
             exceedsLimit: false,
             limitBytes: maxLimitBytes,
             strategy: 'direct_http',
@@ -2033,18 +2037,18 @@ async function runExtractionPipeline(
     }
   }
 
-  try {
-    return await extractWithYtDlp(parsedUrl, options);
-  } catch (err) {
-    errors.push(`yt-dlp: ${(err as Error).message}`);
-  }
-
   if (parsedUrl.platform === 'instagram') {
     try {
       return await extractInstagramFallback(parsedUrl, maxLimitBytes);
     } catch (err) {
       errors.push(`instagram-fallback: ${(err as Error).message}`);
     }
+  }
+
+  try {
+    return await extractWithYtDlp(parsedUrl, options);
+  } catch (err) {
+    errors.push(`yt-dlp: ${(err as Error).message}`);
   }
 
   if (parsedUrl.platform === 'twitter') {

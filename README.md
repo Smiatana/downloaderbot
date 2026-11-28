@@ -146,6 +146,10 @@ Sign in to the **Telegram Bot** panel, enter a token (unless already set in the
 environment), and start the bot. Send a supported link to the bot in Telegram.
 Use **Media to Send from Every Source** to choose video, music, or both. The
 default is both, matching the prior behavior.
+In a private chat, send `/start` once. In groups, Telegram privacy mode hides
+ordinary link messages from bots; disable privacy for the bot with @BotFather's
+`/setprivacy` command or make the bot a group administrator if it should read
+links that are not commands, mentions, or replies.
 The bot also supports:
 
 - `/start` — usage information.

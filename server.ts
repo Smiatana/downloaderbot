@@ -241,13 +241,22 @@ async function bootstrap() {
 
   // Auto-start Telegram bot if TELEGRAM_BOT_TOKEN env var is configured
   if (process.env.TELEGRAM_BOT_TOKEN?.trim()) {
-    telegramBotManager.start().catch((err) => {
+    console.info('TELEGRAM_BOT_TOKEN is configured; starting Telegram bot polling.');
+    telegramBotManager.start().then((status) => {
+      console.info(`Telegram bot startup accepted for @${status.botUsername ?? 'unknown'}.`);
+    }).catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Telegram bot auto-start failed: ${message}`);
       telemetry.logEvent({
         source: 'system',
         level: 'error',
-        message: `Auto-start Telegram bot failed: ${(err as Error).message}`,
+        message: `Auto-start Telegram bot failed: ${message}`,
       });
     });
+  } else {
+    console.warn(
+      'Telegram bot is not running: no TELEGRAM_BOT_TOKEN is configured. Set it in the Bot panel and press Start, or configure it in the environment.'
+    );
   }
 
   app.get('/api/health', (_req, res) => {
