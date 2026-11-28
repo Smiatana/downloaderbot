@@ -39,12 +39,18 @@ export function getYtDlpReleaseUrl(arch: string): string {
   return `${YTDLP_RELEASE_BASE_URL}/${asset}`;
 }
 
+export function isTermuxEnvironment(
+  prefix: string | undefined = process.env.PREFIX,
+  termuxVersion: string | undefined = process.env.TERMUX_VERSION
+): boolean {
+  return Boolean(termuxVersion) || Boolean(prefix?.includes('/com.termux/'));
+}
+
 export function getTermuxYtDlpPath(
   prefix?: string,
   termuxVersion?: string
 ): string | undefined {
-  const isTermux = Boolean(termuxVersion) || Boolean(prefix?.includes('/com.termux/'));
-  if (!isTermux) return undefined;
+  if (!isTermuxEnvironment(prefix, termuxVersion)) return undefined;
   return path.join(prefix || '/data/data/com.termux/files/usr', 'bin', 'yt-dlp');
 }
 
@@ -806,8 +812,7 @@ async function extractWithYtDlp(
 
   const args = [
     '--dump-single-json',
-    '--js-runtimes',
-    'node',
+    ...(isTermuxEnvironment() ? [] : ['--js-runtimes', 'node']),
     '--no-warnings',
     '--skip-download',
     '--socket-timeout',
@@ -1002,22 +1007,32 @@ async function extractRedditFallback(
   const clean = parsedTarget.toString().replace(/\/$/, '');
   const jsonUrl = clean.endsWith('.json') ? clean : `${clean}.json?raw_json=1`;
 
+  const redditHeaders = {
+    'User-Agent': 'linux:streambot:v1.0 (by /u/streambot)',
+    Accept: 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+  };
+
   let res = await undiciFetch(jsonUrl, {
-    headers: {
-      'User-Agent': 'linux:streambot:v1.0 (by /u/streambot)',
-      Accept: 'application/json',
-    },
+    headers: redditHeaders,
     redirect: 'follow',
     dispatcher: metadataHttpAgent,
   });
 
   if (!res.ok) {
+    const apiUrl = jsonUrl.replace('://www.reddit.com', '://api.reddit.com');
+    res = await undiciFetch(apiUrl, {
+      headers: redditHeaders,
+      redirect: 'follow',
+      dispatcher: metadataHttpAgent,
+    });
+  }
+
+  if (!res.ok) {
     const oldUrl = jsonUrl.replace('://www.reddit.com', '://old.reddit.com');
     res = await undiciFetch(oldUrl, {
-      headers: {
-        'User-Agent': 'linux:streambot:v1.0 (by /u/streambot)',
-        Accept: 'application/json',
-      },
+      headers: redditHeaders,
       redirect: 'follow',
       dispatcher: metadataHttpAgent,
     });

@@ -159,26 +159,27 @@ export async function splitVideoStreamForAudio(
   };
 }
 
-async function openYtDlpAudioFallback(
+async function openYtDlpFallback(
   asset: MediaAsset,
+  mode: 'audio' | 'video',
   onComplete?: (totalBytes: number, durationMs: number) => void
 ): Promise<OpenedZeroDiskStream> {
-  const { ensureYtDlpBinary } = await import('./extractor.ts');
+  const { ensureYtDlpBinary, isTermuxEnvironment } = await import('./extractor.ts');
   const ytDlpBin = await ensureYtDlpBinary();
-  const proc = spawn(
-    ytDlpBin,
-    [
-      '-f',
-      'bestaudio/best',
-      '--js-runtimes',
-      'node',
-      '--no-warnings',
-      '-o',
-      '-',
-      asset.sourceUrl,
-    ],
-    { shell: false, stdio: ['ignore', 'pipe', 'pipe'] }
-  );
+  const formatSelector = mode === 'audio' ? 'bestaudio/best' : 'best[ext=mp4]/best';
+  const args = [
+    '-f',
+    formatSelector,
+    ...(isTermuxEnvironment() ? [] : ['--js-runtimes', 'node']),
+    '--no-warnings',
+    '-o',
+    '-',
+    asset.sourceUrl,
+  ];
+  const proc = spawn(ytDlpBin, args, {
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   let stderrMsg = '';
   proc.stderr.on('data', (chunk: Buffer) => {
     stderrMsg = appendStderr(stderrMsg, chunk);
@@ -187,13 +188,13 @@ async function openYtDlpAudioFallback(
   proc.on('close', (code) => {
     if (code && code !== 0 && !proc.stdout.destroyed) {
       proc.stdout.destroy(
-        new Error(`yt-dlp audio fallback exited ${code}: ${stderrMsg.slice(-200)}`)
+        new Error(`yt-dlp ${mode} fallback exited ${code}: ${stderrMsg.slice(-200)}`)
       );
     }
   });
 
   try {
-    await assertReadableHasData(proc.stdout);
+    await assertReadableHasData(proc.stdout, 15_000);
   } catch (error) {
     if (proc.exitCode === null && proc.signalCode === null) {
       await new Promise<void>((resolve) => {
@@ -213,14 +214,14 @@ async function openYtDlpAudioFallback(
     const detail = stderrMsg.trim().slice(-1200);
     throw new Error(
       detail
-        ? `yt-dlp audio fallback produced no media bytes: ${detail}`
-        : `yt-dlp audio fallback produced no media bytes: ${error instanceof Error ? error.message : String(error)}`
+        ? `yt-dlp ${mode} fallback produced no media bytes: ${detail}`
+        : `yt-dlp ${mode} fallback produced no media bytes: ${error instanceof Error ? error.message : String(error)}`
     );
   }
 
   return {
     stream: attachByteMeter(proc.stdout, onComplete),
-    contentType: asset.mimeType,
+    contentType: mode === 'audio' ? asset.mimeType : 'video/mp4',
     filename: asset.filename,
     cleanup: () => {
       if (!proc.killed) proc.kill('SIGKILL');
@@ -300,6 +301,7 @@ export async function openZeroDiskStream(
     proc.stderr.on('data', (d: Buffer) => {
       stderrMsg = appendStderr(stderrMsg, d);
     });
+    proc.on('error', (err) => proc.stdout.destroy(err));
     proc.on('close', (code) => {
       if (code && code !== 0 && !proc.stdout.destroyed) {
         proc.stdout.destroy(
@@ -309,6 +311,22 @@ export async function openZeroDiskStream(
     });
 
     const metered = attachByteMeter(proc.stdout, options.onComplete);
+    try {
+      await assertReadableHasData(metered, 15_000);
+    } catch (err) {
+      metered.destroy();
+      if (!proc.killed) proc.kill('SIGKILL');
+      if (asset.sourceUrl && !shouldCompress) {
+        return openYtDlpFallback(asset, 'video', options.onComplete);
+      }
+      const detail = stderrMsg.trim().slice(-400);
+      throw new Error(
+        detail
+          ? `FFmpeg DASH mux produced no media bytes: ${detail}`
+          : `FFmpeg DASH mux produced no media bytes: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+
     return {
       stream: metered,
       contentType: 'video/mp4',
@@ -340,13 +358,13 @@ export async function openZeroDiskStream(
       const ytDlpBin = await ensureYtDlpBinary();
 
       if (shouldExtractMp3) {
+        const { isTermuxEnvironment } = await import('./extractor.ts');
         const ytdlpProc = spawn(
           ytDlpBin,
           [
             '-f',
             'bestaudio/best',
-            '--js-runtimes',
-            'node',
+            ...(isTermuxEnvironment() ? [] : ['--js-runtimes', 'node']),
             '--no-warnings',
             '-o',
             '-',
@@ -402,6 +420,14 @@ export async function openZeroDiskStream(
         });
 
         const metered = attachByteMeter(ffmpegProc.stdout, options.onComplete);
+        try {
+          await assertReadableHasData(metered, 15_000);
+        } catch (err) {
+          metered.destroy();
+          if (!ytdlpProc.killed) ytdlpProc.kill('SIGKILL');
+          if (!ffmpegProc.killed) ffmpegProc.kill('SIGKILL');
+          throw err;
+        }
         return {
           stream: metered,
           contentType: 'audio/mpeg',
@@ -414,48 +440,10 @@ export async function openZeroDiskStream(
       }
 
       if (asset.kind === 'audio') {
-        return openYtDlpAudioFallback(asset, options.onComplete);
+        return openYtDlpFallback(asset, 'audio', options.onComplete);
       }
 
-      const proc = spawn(
-        ytDlpBin,
-        [
-          '-f',
-          'best[ext=mp4]/best',
-          '--js-runtimes',
-          'node',
-          '--no-warnings',
-          '-o',
-          '-',
-          asset.sourceUrl,
-        ],
-        {
-          shell: false,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        }
-      );
-
-      let stderrMsg = '';
-      proc.stderr.on('data', (d: Buffer) => {
-        stderrMsg = appendStderr(stderrMsg, d);
-      });
-      proc.on('close', (code) => {
-        if (code && code !== 0 && !proc.stdout.destroyed) {
-          proc.stdout.destroy(
-            new Error(`yt-dlp stdout pipe exited ${code}: ${stderrMsg.slice(0, 200)}`)
-          );
-        }
-      });
-
-      const metered = attachByteMeter(proc.stdout, options.onComplete);
-      return {
-        stream: metered,
-        contentType: 'video/mp4',
-        filename: asset.filename,
-        cleanup: () => {
-          if (!proc.killed) proc.kill('SIGKILL');
-        },
-      };
+      return openYtDlpFallback(asset, 'video', options.onComplete);
     }
 
     throw new Error(`Upstream media returned HTTP ${upstreamRes.status}`);
@@ -472,7 +460,7 @@ export async function openZeroDiskStream(
     } catch (error) {
       upstreamReadable.destroy();
       if (asset.sourceUrl) {
-        return openYtDlpAudioFallback(asset, options.onComplete);
+        return openYtDlpFallback(asset, 'audio', options.onComplete);
       }
       throw error;
     }
@@ -537,6 +525,17 @@ export async function openZeroDiskStream(
     });
 
     const metered = attachByteMeter(proc.stdout, options.onComplete);
+    try {
+      await assertReadableHasData(metered, 15_000);
+    } catch (err) {
+      metered.destroy();
+      upstreamReadable.destroy();
+      if (!proc.killed) proc.kill('SIGKILL');
+      if (asset.sourceUrl) {
+        return openYtDlpFallback(asset, 'audio', options.onComplete);
+      }
+      throw err;
+    }
     return {
       stream: metered,
       contentType: 'audio/mpeg',
@@ -579,14 +578,39 @@ export async function openZeroDiskStream(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
+    let stderrMsg = '';
+    proc.stderr.on('data', (d: Buffer) => {
+      stderrMsg = appendStderr(stderrMsg, d);
+    });
     upstreamReadable.pipe(proc.stdin);
     upstreamReadable.on('error', (err) => {
       if (!proc.killed) proc.kill('SIGKILL');
       proc.stdout.destroy(err);
     });
     proc.stdin.on('error', () => {});
+    proc.on('error', (err) => proc.stdout.destroy(err));
+    proc.on('close', (code) => {
+      if (code && code !== 0 && !proc.stdout.destroyed) {
+        proc.stdout.destroy(
+          new Error(`FFmpeg compression pipe exited ${code}: ${stderrMsg.slice(0, 200)}`)
+        );
+      }
+    });
 
     const metered = attachByteMeter(proc.stdout, options.onComplete);
+    try {
+      await assertReadableHasData(metered, 20_000);
+    } catch (err) {
+      metered.destroy();
+      upstreamReadable.destroy();
+      if (!proc.killed) proc.kill('SIGKILL');
+      const detail = stderrMsg.trim().slice(-400);
+      throw new Error(
+        detail
+          ? `FFmpeg compression produced no media bytes: ${detail}`
+          : `FFmpeg compression produced no media bytes: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
     return {
       stream: metered,
       contentType: 'video/mp4',
@@ -598,13 +622,32 @@ export async function openZeroDiskStream(
     };
   }
 
-  // Strategy 4: Pure zero-copy HTTP pass-through stream
+  // Strategy 4: Pure zero-copy HTTP pass-through stream.
+  // Validate the stream has data before returning it to avoid Telegram's
+  // "file must be non-empty" error when CDN URLs silently return 0 bytes.
   const contentLengthHeader = upstreamRes.headers.get('content-length');
   const contentLength = contentLengthHeader
     ? Number(contentLengthHeader)
     : asset.estimatedBytes;
 
   const metered = attachByteMeter(upstreamReadable, options.onComplete);
+
+  try {
+    await assertReadableHasData(metered, 12_000);
+  } catch (streamErr) {
+    metered.destroy();
+    // If we have the original source URL, re-download via yt-dlp stdout as a
+    // last-resort fallback rather than propagating a confusing "empty file" error.
+    if (asset.sourceUrl) {
+      return openYtDlpFallback(
+        asset,
+        asset.kind === 'audio' || shouldExtractMp3 ? 'audio' : 'video',
+        options.onComplete
+      );
+    }
+    throw streamErr;
+  }
+
   return {
     stream: metered,
     contentType:

@@ -148,6 +148,16 @@ class TelegramBotManager {
     }
   }
 
+  private saveChatQualityPref(chatId: number, quality: YouTubeQuality): void {
+    this.chatQualityPrefs.delete(chatId);
+    this.chatQualityPrefs.set(chatId, quality);
+    while (this.chatQualityPrefs.size > 2000) {
+      const oldestChatId = this.chatQualityPrefs.keys().next().value;
+      if (oldestChatId === undefined) break;
+      this.chatQualityPrefs.delete(oldestChatId);
+    }
+  }
+
   getStatus(): BotStatusSnapshot {
     const limitMb = Math.round(this.getLimitBytes() / (1024 * 1024));
     return {
@@ -395,7 +405,7 @@ class TelegramBotManager {
     bot.callbackQuery(/^ytq:(360|720|1080)$/, async (ctx) => {
       const q = ctx.match[1] as YouTubeQuality;
       if (ctx.chat) {
-        this.chatQualityPrefs.set(ctx.chat.id, q);
+        this.saveChatQualityPref(ctx.chat.id, q);
       }
       await ctx.answerCallbackQuery({ text: `YouTube quality set to ${q}p` });
       await ctx.editMessageText(`YouTube target resolution set to ${q}p.`);
@@ -575,12 +585,16 @@ class TelegramBotManager {
         message: `${failureStage}: ${safeDetail}`,
         durationMs: Date.now() - startedAt,
       });
+      const userMessage =
+        parsedUrl.platform === 'instagram' &&
+        !this.config.cookiesHeader &&
+        failureStage === 'yt-dlp metadata extraction'
+          ? '❌ Instagram requires login cookies to download media. Add your Instagram cookies in the web panel under Bot Settings → Cookie Header (e.g. sessionid=...).'
+          : `❌ Media failed during ${failureStage}.${safeDetail ? ` Reason: ${safeDetail}` : ''}`;
       await bot.api
-        .sendMessage(
-          chatId,
-          `❌ Media failed during ${failureStage}.${safeDetail ? ` Reason: ${safeDetail}` : ''}`,
-          { reply_parameters: { message_id: replyToMessageId } }
-        )
+        .sendMessage(chatId, userMessage, {
+          reply_parameters: { message_id: replyToMessageId },
+        })
         .catch(() => {});
     }
   }

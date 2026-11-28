@@ -14,6 +14,7 @@ import {
   buildAssetsFromYtDlpPayload,
   getTermuxYtDlpPath,
   getYtDlpReleaseUrl,
+  isTermuxEnvironment,
   parseTikTokHtmlPayload,
   pickBestAudioFormat,
   pickFormatsForEntry,
@@ -830,4 +831,24 @@ test('HTTP Server Integration: health, auth, bot guard, extract validation, and 
   } finally {
     serverProc.kill('SIGKILL');
   }
+});
+
+test('Termux detection and stream non-empty validation', async () => {
+  assert.equal(isTermuxEnvironment('/data/data/com.termux/files/usr', undefined), true);
+  assert.equal(isTermuxEnvironment(undefined, '0.118.0'), true);
+  assert.equal(isTermuxEnvironment('/usr', undefined), false);
+
+  const emptyStream = Readable.from([]);
+  await assert.rejects(
+    () => assertReadableHasData(emptyStream, 500),
+    /without sending data/i
+  );
+
+  const nonEmptyStream = Readable.from([Buffer.from('hello'), Buffer.from(' world')]);
+  await assertReadableHasData(nonEmptyStream, 500);
+  const chunks: Buffer[] = [];
+  for await (const chunk of nonEmptyStream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  assert.equal(Buffer.concat(chunks).toString('utf8'), 'hello world');
 });
