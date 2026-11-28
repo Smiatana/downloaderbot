@@ -93,6 +93,19 @@ const INNERTUBE_CLIENTS: InnerTubeClientProfile[] = [
       gl: 'US',
     },
   },
+  {
+    name: 'TVHTML5',
+    userAgent:
+      'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
+    clientNameHeader: '7',
+    clientVersion: '7.20250312.16.00',
+    contextClient: {
+      clientName: 'TVHTML5',
+      clientVersion: '7.20250312.16.00',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
 ];
 
 export interface InnerTubeFormat {
@@ -603,6 +616,43 @@ async function fetchYouTubeMusicPlaylistVideoIds(
   return ids;
 }
 
+async function probePlayableStream(
+  url: string,
+  headers: Record<string, string>
+): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const res = await undiciFetch(url, {
+      method: 'GET',
+      headers: {
+        ...headers,
+        Range: 'bytes=0-1023',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(5_000),
+      dispatcher: youtubeHttpAgent,
+    });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return { ok: false, reason: `HTTP ${res.status}` };
+    }
+    const reader = res.body?.getReader();
+    if (!reader) {
+      return { ok: false, reason: 'empty response body' };
+    }
+    const firstChunk = await reader.read();
+    await reader.cancel().catch(() => {});
+    if (firstChunk.done || !firstChunk.value || firstChunk.value.byteLength === 0) {
+      return { ok: false, reason: '0 bytes returned' };
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 async function resolveSingleYouTubeVideo(
   videoId: string,
   parsedUrl: ParsedMediaUrl,
@@ -650,6 +700,14 @@ async function resolveSingleYouTubeVideo(
       });
 
       if (built.assets.length > 0) {
+        const probe = await probePlayableStream(
+          built.assets[0].streamUrl,
+          streamHeaders
+        );
+        if (!probe.ok) {
+          errors.push(`${profile.name}: stream rejected (${probe.reason})`);
+          continue;
+        }
         return {
           ...built,
           extractorUsed: `innertube-${profile.name.toLowerCase()}`,

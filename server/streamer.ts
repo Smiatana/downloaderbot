@@ -329,7 +329,7 @@ export async function openZeroDiskStream(
     } catch (err) {
       metered.destroy();
       if (!proc.killed) proc.kill('SIGKILL');
-      if (asset.sourceUrl && !shouldCompress) {
+      if (!isYouTubePlatform(asset.platform) && asset.sourceUrl && !shouldCompress) {
         return openYtDlpFallback(asset, 'video', options.onComplete);
       }
       const detail = stderrMsg.trim().slice(-400);
@@ -474,7 +474,7 @@ export async function openZeroDiskStream(
       await assertReadableHasData(upstreamReadable);
     } catch (error) {
       upstreamReadable.destroy();
-      if (asset.sourceUrl) {
+      if (!isYouTubePlatform(asset.platform) && asset.sourceUrl) {
         return openYtDlpFallback(asset, 'audio', options.onComplete);
       }
       throw error;
@@ -546,7 +546,7 @@ export async function openZeroDiskStream(
       metered.destroy();
       upstreamReadable.destroy();
       if (!proc.killed) proc.kill('SIGKILL');
-      if (asset.sourceUrl) {
+      if (!isYouTubePlatform(asset.platform) && asset.sourceUrl) {
         return openYtDlpFallback(asset, 'audio', options.onComplete);
       }
       throw err;
@@ -653,7 +653,7 @@ export async function openZeroDiskStream(
     metered.destroy();
     // If we have the original source URL, re-download via yt-dlp stdout as a
     // last-resort fallback rather than propagating a confusing "empty file" error.
-    if (asset.sourceUrl) {
+    if (!isYouTubePlatform(asset.platform) && asset.sourceUrl) {
       return openYtDlpFallback(
         asset,
         asset.kind === 'audio' || shouldExtractMp3 ? 'audio' : 'video',
