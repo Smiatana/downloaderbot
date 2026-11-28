@@ -34,6 +34,7 @@ import {
   buildAssetsFromInnerTubePlayer,
   extractYouTubePlaylistId,
   extractYouTubeVideoId,
+  parseWatchPageBootstrap,
 } from '../server/youtubeDirect.ts';
 
 const LIMIT_50MB = 50 * 1024 * 1024;
@@ -944,4 +945,13 @@ test('Direct YouTube InnerTube parser: video + FFmpeg audio extraction & YouTube
   assert.equal(ytMusic.assets[0].ext, 'mp3');
   assert.equal(ytMusic.assets[0].strategy, 'ffmpeg_extract_mp3');
   assert.equal(ytMusic.assets[0].streamUrl, 'https://rr1.googlevideo.com/videoplayback?itag=22');
+
+  const fakeWatchHtml = `
+    <script>ytcfg.set({"INNERTUBE_API_KEY":"TEST_KEY_123","VISITOR_DATA":"CgtTESTVISITOR"});</script>
+    <script>var ytInitialPlayerResponse = {"playabilityStatus":{"status":"OK"},"videoDetails":{"title":"Demo {Brace} Title"}};</script>
+  `;
+  const bootstrap = parseWatchPageBootstrap(fakeWatchHtml);
+  assert.equal(bootstrap.apiKey, 'TEST_KEY_123');
+  assert.equal(bootstrap.visitorData, 'CgtTESTVISITOR');
+  assert.equal(bootstrap.playerResponse?.videoDetails?.title, 'Demo {Brace} Title');
 });

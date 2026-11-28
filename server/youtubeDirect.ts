@@ -16,6 +16,7 @@ const youtubeHttpAgent = new Agent({
 });
 
 const DEFAULT_LIMIT_BYTES = 50 * 1024 * 1024;
+const DEFAULT_INNERTUBE_API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -29,18 +30,36 @@ interface InnerTubeClientProfile {
 
 const INNERTUBE_CLIENTS: InnerTubeClientProfile[] = [
   {
+    name: 'ANDROID_VR',
+    userAgent:
+      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+    clientNameHeader: '28',
+    clientVersion: '1.60.19',
+    contextClient: {
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.60.19',
+      deviceMake: 'Oculus',
+      deviceModel: 'Quest 3',
+      androidSdkVersion: 32,
+      osName: 'Android',
+      osVersion: '12L',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
     name: 'IOS',
     userAgent:
-      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+      'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)',
     clientNameHeader: '5',
-    clientVersion: '19.45.4',
+    clientVersion: '20.10.4',
     contextClient: {
       clientName: 'IOS',
-      clientVersion: '19.45.4',
+      clientVersion: '20.10.4',
       deviceMake: 'Apple',
       deviceModel: 'iPhone16,2',
       osName: 'iPhone',
-      osVersion: '18.1.0',
+      osVersion: '18.3.2.22D82',
       hl: 'en',
       gl: 'US',
     },
@@ -48,27 +67,28 @@ const INNERTUBE_CLIENTS: InnerTubeClientProfile[] = [
   {
     name: 'ANDROID',
     userAgent:
-      'com.google.android.youtube/19.45.36 (Linux; U; Android 14; en_US) gzip',
+      'com.google.android.youtube/20.10.38 (Linux; U; Android 15; en_US) gzip',
     clientNameHeader: '3',
-    clientVersion: '19.45.36',
+    clientVersion: '20.10.38',
     contextClient: {
       clientName: 'ANDROID',
-      clientVersion: '19.45.36',
-      androidSdkVersion: 34,
+      clientVersion: '20.10.38',
+      androidSdkVersion: 35,
       osName: 'Android',
-      osVersion: '14',
+      osVersion: '15',
       hl: 'en',
       gl: 'US',
     },
   },
   {
-    name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-    userAgent: BROWSER_USER_AGENT,
-    clientNameHeader: '85',
-    clientVersion: '2.0',
+    name: 'MWEB',
+    userAgent:
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Mobile/15E148 Safari/604.1',
+    clientNameHeader: '2',
+    clientVersion: '2.20250311.03.00',
     contextClient: {
-      clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-      clientVersion: '2.0',
+      clientName: 'MWEB',
+      clientVersion: '2.20250311.03.00',
       hl: 'en',
       gl: 'US',
     },
@@ -372,29 +392,129 @@ export function buildAssetsFromInnerTubePlayer(
   return { title, author, assets };
 }
 
+export function extractBalancedJsonObject(
+  text: string,
+  startSearchIdx: number
+): string | null {
+  const openIdx = text.indexOf('{', startSearchIdx);
+  if (openIdx === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = openIdx; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(openIdx, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+export function parseWatchPageBootstrap(html: string): {
+  apiKey: string;
+  visitorData?: string;
+  playerResponse?: InnerTubePlayerResponse;
+} {
+  const apiKeyMatch = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+  const visitorMatch = html.match(/"VISITOR_DATA"\s*:\s*"([^"]+)"/);
+  let playerResponse: InnerTubePlayerResponse | undefined;
+
+  for (const marker of [
+    'var ytInitialPlayerResponse = ',
+    'window["ytInitialPlayerResponse"] = ',
+    'ytInitialPlayerResponse = ',
+  ]) {
+    const idx = html.indexOf(marker);
+    if (idx !== -1) {
+      const jsonText = extractBalancedJsonObject(html, idx + marker.length);
+      if (jsonText) {
+        try {
+          playerResponse = JSON.parse(jsonText) as InnerTubePlayerResponse;
+          break;
+        } catch {
+          // Try next marker
+        }
+      }
+    }
+  }
+
+  return {
+    apiKey: apiKeyMatch?.[1] || DEFAULT_INNERTUBE_API_KEY,
+    visitorData: visitorMatch?.[1],
+    playerResponse,
+  };
+}
+
+async function fetchWatchPageBootstrap(
+  videoId: string,
+  cookiesHeader?: string
+): Promise<{
+  apiKey: string;
+  visitorData?: string;
+  playerResponse?: InnerTubePlayerResponse;
+}> {
+  const headers: Record<string, string> = {
+    'User-Agent': BROWSER_USER_AGENT,
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  if (cookiesHeader?.trim()) {
+    headers.Cookie = cookiesHeader.trim();
+  }
+
+  try {
+    const res = await undiciFetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(8_000),
+      dispatcher: youtubeHttpAgent,
+    });
+    if (!res.ok) {
+      return { apiKey: DEFAULT_INNERTUBE_API_KEY };
+    }
+    const html = await res.text();
+    return parseWatchPageBootstrap(html);
+  } catch {
+    return { apiKey: DEFAULT_INNERTUBE_API_KEY };
+  }
+}
+
 async function fetchInnerTubePlayer(
   videoId: string,
   profile: InnerTubeClientProfile,
+  bootstrap: { apiKey: string; visitorData?: string },
   cookiesHeader?: string
 ): Promise<InnerTubePlayerResponse> {
-  const endpoint =
-    profile.name === 'TVHTML5_SIMPLY_EMBEDDED_PLAYER'
-      ? 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
-      : 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+  const endpoint = `https://www.youtube.com/youtubei/v1/player?key=${encodeURIComponent(bootstrap.apiKey)}&prettyPrint=false`;
+
+  const clientContext: Record<string, unknown> = {
+    ...profile.contextClient,
+    ...(bootstrap.visitorData ? { visitorData: bootstrap.visitorData } : {}),
+  };
 
   const body: Record<string, unknown> = {
     videoId,
     contentCheckOk: true,
     racyCheckOk: true,
     context: {
-      client: profile.contextClient,
-      ...(profile.name === 'TVHTML5_SIMPLY_EMBEDDED_PLAYER'
-        ? {
-            thirdParty: {
-              embedUrl: `https://www.youtube.com/watch?v=${videoId}`,
-            },
-          }
-        : {}),
+      client: clientContext,
     },
   };
 
@@ -405,6 +525,9 @@ async function fetchInnerTubePlayer(
     'X-YouTube-Client-Version': profile.clientVersion,
     Origin: 'https://www.youtube.com',
   };
+  if (bootstrap.visitorData) {
+    headers['X-Goog-Visitor-Id'] = bootstrap.visitorData;
+  }
   if (cookiesHeader?.trim()) {
     headers.Cookie = cookiesHeader.trim();
   }
@@ -418,43 +541,13 @@ async function fetchInnerTubePlayer(
   });
 
   if (!res.ok) {
-    throw new Error(`InnerTube ${profile.name} returned HTTP ${res.status}`);
+    const errText = await res.text().catch(() => '');
+    const snippet = errText.replace(/\s+/g, ' ').slice(0, 140);
+    throw new Error(
+      `InnerTube ${profile.name} returned HTTP ${res.status}${snippet ? `: ${snippet}` : ''}`
+    );
   }
   return (await res.json()) as InnerTubePlayerResponse;
-}
-
-async function fetchWatchPagePlayerResponse(
-  videoId: string,
-  cookiesHeader?: string
-): Promise<InnerTubePlayerResponse | null> {
-  const headers: Record<string, string> = {
-    'User-Agent': BROWSER_USER_AGENT,
-    'Accept-Language': 'en-US,en;q=0.9',
-  };
-  if (cookiesHeader?.trim()) {
-    headers.Cookie = cookiesHeader.trim();
-  }
-
-  const res = await undiciFetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers,
-    redirect: 'follow',
-    signal: AbortSignal.timeout(10_000),
-    dispatcher: youtubeHttpAgent,
-  });
-  if (!res.ok) return null;
-  const html = await res.text();
-  const marker = 'var ytInitialPlayerResponse = ';
-  const idx = html.indexOf(marker);
-  if (idx === -1) return null;
-  const jsonStart = idx + marker.length;
-  const endIdx = html.indexOf(';</script>', jsonStart);
-  if (endIdx === -1) return null;
-
-  try {
-    return JSON.parse(html.slice(jsonStart, endIdx)) as InnerTubePlayerResponse;
-  } catch {
-    return null;
-  }
 }
 
 async function fetchYouTubeMusicPlaylistVideoIds(
@@ -524,11 +617,14 @@ async function resolveSingleYouTubeVideo(
   const quality = options.youtubeQuality ?? '720';
   const errors: string[] = [];
 
+  const bootstrap = await fetchWatchPageBootstrap(videoId, options.cookiesHeader);
+
   for (const profile of INNERTUBE_CLIENTS) {
     try {
       const player = await fetchInnerTubePlayer(
         videoId,
         profile,
+        bootstrap,
         options.cookiesHeader
       );
       const status = player.playabilityStatus?.status;
@@ -565,32 +661,24 @@ async function resolveSingleYouTubeVideo(
     }
   }
 
-  // Fallback to watch page ytInitialPlayerResponse
-  try {
-    const watchPlayer = await fetchWatchPagePlayerResponse(
-      videoId,
-      options.cookiesHeader
-    );
-    if (watchPlayer?.streamingData) {
-      const built = buildAssetsFromInnerTubePlayer(watchPlayer, {
-        platform: parsedUrl.platform,
-        sourceUrl: parsedUrl.normalizedUrl,
-        quality,
-        maxLimitBytes,
-        streamHeaders: {
-          'User-Agent': BROWSER_USER_AGENT,
-          Referer: 'https://www.youtube.com/',
-        },
-      });
-      if (built.assets.length > 0) {
-        return {
-          ...built,
-          extractorUsed: 'youtube-watch-html',
-        };
-      }
+  // Fallback to watch page ytInitialPlayerResponse if it has direct URLs
+  if (bootstrap.playerResponse?.streamingData) {
+    const built = buildAssetsFromInnerTubePlayer(bootstrap.playerResponse, {
+      platform: parsedUrl.platform,
+      sourceUrl: parsedUrl.normalizedUrl,
+      quality,
+      maxLimitBytes,
+      streamHeaders: {
+        'User-Agent': BROWSER_USER_AGENT,
+        Referer: 'https://www.youtube.com/',
+      },
+    });
+    if (built.assets.length > 0) {
+      return {
+        ...built,
+        extractorUsed: 'youtube-watch-html',
+      };
     }
-  } catch (err) {
-    errors.push(`watch-html: ${(err as Error).message}`);
   }
 
   throw new Error(
