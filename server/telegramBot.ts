@@ -458,7 +458,7 @@ class TelegramBotManager {
       const quality =
         this.chatQualityPrefs.get(chatId) ?? this.config.youtubeQuality;
 
-      failureStage = 'yt-dlp metadata extraction';
+      failureStage = 'media metadata extraction';
       const extraction = await extractMedia(parsedUrl, {
         youtubeQuality: quality,
         maxLimitBytes,
@@ -588,7 +588,7 @@ class TelegramBotManager {
       const userMessage =
         parsedUrl.platform === 'instagram' &&
         !this.config.cookiesHeader &&
-        failureStage === 'yt-dlp metadata extraction'
+        failureStage === 'media metadata extraction'
           ? '❌ Instagram requires login cookies to download media. Add your Instagram cookies in the web panel under Bot Settings → Cookie Header (e.g. sessionid=...).'
           : `❌ Media failed during ${failureStage}.${safeDetail ? ` Reason: ${safeDetail}` : ''}`;
       await bot.api

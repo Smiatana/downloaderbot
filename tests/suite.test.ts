@@ -30,6 +30,11 @@ import {
   assertReadableHasData,
   splitVideoStreamForAudio,
 } from '../server/streamer.ts';
+import {
+  buildAssetsFromInnerTubePlayer,
+  extractYouTubePlaylistId,
+  extractYouTubeVideoId,
+} from '../server/youtubeDirect.ts';
 
 const LIMIT_50MB = 50 * 1024 * 1024;
 
@@ -851,4 +856,92 @@ test('Termux detection and stream non-empty validation', async () => {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   assert.equal(Buffer.concat(chunks).toString('utf8'), 'hello world');
+});
+
+test('Direct YouTube InnerTube parser: video + FFmpeg audio extraction & YouTube Music', () => {
+  assert.equal(extractYouTubeVideoId('https://www.youtube.com/watch?v=7-Ii1Z8kTlo'), '7-Ii1Z8kTlo');
+  assert.equal(extractYouTubeVideoId('https://youtu.be/7-Ii1Z8kTlo'), '7-Ii1Z8kTlo');
+  assert.equal(extractYouTubeVideoId('https://www.youtube.com/shorts/7-Ii1Z8kTlo'), '7-Ii1Z8kTlo');
+  assert.equal(extractYouTubeVideoId('https://music.youtube.com/watch?v=7-Ii1Z8kTlo'), '7-Ii1Z8kTlo');
+  assert.equal(
+    extractYouTubePlaylistId('https://music.youtube.com/playlist?list=PL1234567890'),
+    'PL1234567890'
+  );
+
+  const samplePlayer = {
+    playabilityStatus: { status: 'OK' },
+    videoDetails: {
+      videoId: '7-Ii1Z8kTlo',
+      title: 'Test Track',
+      author: 'Artist - Topic',
+      lengthSeconds: '125',
+      thumbnail: { thumbnails: [{ url: 'https://i.ytimg.com/vi/7-Ii1Z8kTlo/hqdefault.jpg' }] },
+    },
+    streamingData: {
+      formats: [
+        {
+          itag: 18,
+          url: 'https://rr1.googlevideo.com/videoplayback?itag=18',
+          mimeType: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
+          width: 640,
+          height: 360,
+          contentLength: '5000000',
+        },
+        {
+          itag: 22,
+          url: 'https://rr1.googlevideo.com/videoplayback?itag=22',
+          mimeType: 'video/mp4; codecs="avc1.64001F, mp4a.40.2"',
+          width: 1280,
+          height: 720,
+          contentLength: '12000000',
+        },
+      ],
+      adaptiveFormats: [
+        {
+          itag: 137,
+          url: 'https://rr1.googlevideo.com/videoplayback?itag=137',
+          mimeType: 'video/mp4; codecs="avc1.640028"',
+          width: 1920,
+          height: 1080,
+          contentLength: '25000000',
+        },
+        {
+          itag: 140,
+          url: 'https://rr1.googlevideo.com/videoplayback?itag=140',
+          mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+          bitrate: 128000,
+          contentLength: '2000000',
+        },
+      ],
+    },
+  };
+
+  const yt720 = buildAssetsFromInnerTubePlayer(samplePlayer, {
+    platform: 'youtube',
+    sourceUrl: 'https://www.youtube.com/watch?v=7-Ii1Z8kTlo',
+    quality: '720',
+    maxLimitBytes: 50 * 1024 * 1024,
+    streamHeaders: { 'User-Agent': 'test-ua' },
+  });
+  assert.equal(yt720.author, 'Artist');
+  assert.equal(yt720.assets.length, 2);
+  assert.equal(yt720.assets[0].kind, 'video');
+  assert.equal(yt720.assets[0].strategy, 'direct_http');
+  assert.equal(yt720.assets[0].height, 720);
+  assert.equal(yt720.assets[1].kind, 'audio');
+  assert.equal(yt720.assets[1].strategy, 'ffmpeg_extract_mp3');
+  assert.equal(yt720.assets[1].streamUrl, yt720.assets[0].streamUrl);
+
+  const ytMusic = buildAssetsFromInnerTubePlayer(samplePlayer, {
+    platform: 'youtube_music',
+    sourceUrl: 'https://music.youtube.com/watch?v=7-Ii1Z8kTlo',
+    quality: '720',
+    maxLimitBytes: 50 * 1024 * 1024,
+    streamHeaders: { 'User-Agent': 'test-ua' },
+  });
+  assert.equal(ytMusic.assets.length, 1);
+  assert.equal(ytMusic.assets[0].kind, 'audio');
+  assert.equal(ytMusic.assets[0].ext, 'mp3');
+  assert.equal(ytMusic.assets[0].strategy, 'ffmpeg_extract_mp3');
+  assert.equal(ytMusic.assets[0].streamUrl, 'https://rr1.googlevideo.com/videoplayback?itag=22');
 });

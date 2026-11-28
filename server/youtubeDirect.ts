@@ -1,0 +1,670 @@
+import { randomUUID } from 'node:crypto';
+import { Agent, fetch as undiciFetch } from 'undici';
+import type {
+  ExtractionOptions,
+  ExtractionResult,
+  MediaAsset,
+  ParsedMediaUrl,
+  PlatformId,
+  YouTubeQuality,
+} from './types.ts';
+
+const youtubeHttpAgent = new Agent({
+  connections: 24,
+  keepAliveTimeout: 20_000,
+  connectTimeout: 10_000,
+});
+
+const DEFAULT_LIMIT_BYTES = 50 * 1024 * 1024;
+const BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+interface InnerTubeClientProfile {
+  name: string;
+  userAgent: string;
+  clientNameHeader: string;
+  clientVersion: string;
+  contextClient: Record<string, unknown>;
+}
+
+const INNERTUBE_CLIENTS: InnerTubeClientProfile[] = [
+  {
+    name: 'IOS',
+    userAgent:
+      'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X)',
+    clientNameHeader: '5',
+    clientVersion: '19.45.4',
+    contextClient: {
+      clientName: 'IOS',
+      clientVersion: '19.45.4',
+      deviceMake: 'Apple',
+      deviceModel: 'iPhone16,2',
+      osName: 'iPhone',
+      osVersion: '18.1.0',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
+    name: 'ANDROID',
+    userAgent:
+      'com.google.android.youtube/19.45.36 (Linux; U; Android 14; en_US) gzip',
+    clientNameHeader: '3',
+    clientVersion: '19.45.36',
+    contextClient: {
+      clientName: 'ANDROID',
+      clientVersion: '19.45.36',
+      androidSdkVersion: 34,
+      osName: 'Android',
+      osVersion: '14',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+  {
+    name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+    userAgent: BROWSER_USER_AGENT,
+    clientNameHeader: '85',
+    clientVersion: '2.0',
+    contextClient: {
+      clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+      clientVersion: '2.0',
+      hl: 'en',
+      gl: 'US',
+    },
+  },
+];
+
+export interface InnerTubeFormat {
+  itag?: number;
+  url?: string;
+  mimeType?: string;
+  bitrate?: number;
+  width?: number;
+  height?: number;
+  contentLength?: string;
+  approxDurationMs?: string;
+  audioQuality?: string;
+  qualityLabel?: string;
+}
+
+export interface InnerTubePlayerResponse {
+  playabilityStatus?: {
+    status?: string;
+    reason?: string;
+  };
+  videoDetails?: {
+    videoId?: string;
+    title?: string;
+    author?: string;
+    lengthSeconds?: string;
+    thumbnail?: {
+      thumbnails?: Array<{ url?: string; width?: number; height?: number }>;
+    };
+  };
+  streamingData?: {
+    formats?: InnerTubeFormat[];
+    adaptiveFormats?: InnerTubeFormat[];
+  };
+}
+
+function sanitizeFilename(base: string, ext: string): string {
+  const cleaned = base
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 72);
+  return `${cleaned || 'media'}.${ext.replace(/[^a-z0-9]/gi, '') || 'mp4'}`;
+}
+
+function cleanAuthor(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  return raw.replace(/\s*-\s*Topic$/i, '').trim() || undefined;
+}
+
+export function extractYouTubeVideoId(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl);
+    if (u.hostname.replace(/^www\./, '') === 'youtu.be') {
+      const id = u.pathname.split('/').filter(Boolean)[0];
+      return id || null;
+    }
+    const v = u.searchParams.get('v');
+    if (v) return v;
+    const pathMatch = u.pathname.match(/^\/(?:shorts|embed|live)\/([A-Za-z0-9_-]{6,})/);
+    return pathMatch?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function extractYouTubePlaylistId(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl);
+    const list = u.searchParams.get('list');
+    return list && list.length >= 4 ? list : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseContentLength(raw?: string): number | undefined {
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function isMp4Format(fmt: InnerTubeFormat): boolean {
+  return Boolean(fmt.mimeType?.toLowerCase().includes('video/mp4'));
+}
+
+function isAudioFormat(fmt: InnerTubeFormat): boolean {
+  return Boolean(fmt.mimeType?.toLowerCase().startsWith('audio/'));
+}
+
+function isM4aAudioFormat(fmt: InnerTubeFormat): boolean {
+  const mime = fmt.mimeType?.toLowerCase() ?? '';
+  return mime.includes('audio/mp4') || mime.includes('mp4a');
+}
+
+export function buildAssetsFromInnerTubePlayer(
+  player: InnerTubePlayerResponse,
+  options: {
+    platform: PlatformId;
+    sourceUrl: string;
+    quality: YouTubeQuality;
+    maxLimitBytes: number;
+    streamHeaders: Record<string, string>;
+  }
+): {
+  title: string;
+  author?: string;
+  assets: MediaAsset[];
+} {
+  const title = player.videoDetails?.title?.trim() || 'YouTube Media';
+  const author = cleanAuthor(player.videoDetails?.author);
+  const durationSeconds = Number(player.videoDetails?.lengthSeconds);
+  const validDuration =
+    Number.isFinite(durationSeconds) && durationSeconds > 0
+      ? durationSeconds
+      : undefined;
+  const thumbnails = player.videoDetails?.thumbnail?.thumbnails ?? [];
+  const thumbnailUrl = thumbnails[thumbnails.length - 1]?.url;
+
+  const progressive = (player.streamingData?.formats ?? [])
+    .filter((f) => Boolean(f.url) && isMp4Format(f))
+    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0));
+
+  const adaptive = player.streamingData?.adaptiveFormats ?? [];
+  const videoOnly = adaptive
+    .filter((f) => Boolean(f.url) && f.mimeType?.toLowerCase().startsWith('video/'))
+    .sort((a, b) => {
+      const aMp4 = isMp4Format(a) ? 1 : 0;
+      const bMp4 = isMp4Format(b) ? 1 : 0;
+      if (aMp4 !== bMp4) return bMp4 - aMp4;
+      return (b.height ?? 0) - (a.height ?? 0);
+    });
+
+  const audioOnly = adaptive
+    .filter((f) => Boolean(f.url) && isAudioFormat(f))
+    .sort((a, b) => {
+      const aM4a = isM4aAudioFormat(a) ? 1 : 0;
+      const bM4a = isM4aAudioFormat(b) ? 1 : 0;
+      if (aM4a !== bM4a) return bM4a - aM4a;
+      return (b.bitrate ?? 0) - (a.bitrate ?? 0);
+    });
+
+  const targetHeight = Number(options.quality);
+  const assets: MediaAsset[] = [];
+
+  if (options.platform === 'youtube_music') {
+    // Download progressive video (or audio stream fallback) and extract MP3 via FFmpeg
+    const sourceFmt = progressive[0] ?? audioOnly[0];
+    if (sourceFmt?.url) {
+      const est = parseContentLength(sourceFmt.contentLength);
+      assets.push({
+        id: randomUUID(),
+        kind: 'audio',
+        title,
+        author,
+        platform: 'youtube_music',
+        sourceUrl: options.sourceUrl,
+        streamUrl: sourceFmt.url,
+        thumbnailUrl,
+        filename: sanitizeFilename(title, 'mp3'),
+        mimeType: 'audio/mpeg',
+        ext: 'mp3',
+        durationSeconds: validDuration,
+        estimatedBytes: est,
+        exceedsLimit: typeof est === 'number' && est > options.maxLimitBytes,
+        limitBytes: options.maxLimitBytes,
+        strategy: 'ffmpeg_extract_mp3',
+        headers: options.streamHeaders,
+      });
+    }
+    return { title, author, assets };
+  }
+
+  let videoStreamUrlForAudio: string | undefined;
+
+  const fittingProgressive = progressive.filter(
+    (f) => (f.height ?? 0) <= targetHeight
+  );
+  const chosenProg =
+    fittingProgressive.find((f) => {
+      const sz = parseContentLength(f.contentLength);
+      return !sz || sz <= options.maxLimitBytes;
+    }) ??
+    fittingProgressive[0] ??
+    progressive[0];
+
+  if (
+    chosenProg?.url &&
+    (targetHeight <= 720 || videoOnly.length === 0 || (chosenProg.height ?? 0) >= targetHeight)
+  ) {
+    const est = parseContentLength(chosenProg.contentLength);
+    videoStreamUrlForAudio = chosenProg.url;
+    assets.push({
+      id: randomUUID(),
+      kind: 'video',
+      title,
+      author,
+      platform: options.platform,
+      sourceUrl: options.sourceUrl,
+      streamUrl: chosenProg.url,
+      thumbnailUrl,
+      filename: sanitizeFilename(title, 'mp4'),
+      mimeType: 'video/mp4',
+      ext: 'mp4',
+      width: chosenProg.width,
+      height: chosenProg.height,
+      durationSeconds: validDuration,
+      estimatedBytes: est,
+      exceedsLimit: typeof est === 'number' && est > options.maxLimitBytes,
+      limitBytes: options.maxLimitBytes,
+      strategy: 'direct_http',
+      headers: options.streamHeaders,
+      resolutionLabel: chosenProg.height ? `${chosenProg.height}p` : undefined,
+    });
+  } else if (videoOnly.length > 0 && audioOnly.length > 0) {
+    const vMatch =
+      videoOnly.find((f) => (f.height ?? 0) <= targetHeight) ?? videoOnly[0];
+    const aMatch = audioOnly.find(isM4aAudioFormat) ?? audioOnly[0];
+    if (vMatch?.url && aMatch?.url) {
+      const vEst = parseContentLength(vMatch.contentLength) ?? 0;
+      const aEst = parseContentLength(aMatch.contentLength) ?? 0;
+      const totalEst = vEst + aEst > 0 ? vEst + aEst : undefined;
+      videoStreamUrlForAudio = chosenProg?.url ?? aMatch.url;
+      assets.push({
+        id: randomUUID(),
+        kind: 'video',
+        title,
+        author,
+        platform: options.platform,
+        sourceUrl: options.sourceUrl,
+        streamUrl: vMatch.url,
+        audioStreamUrl: aMatch.url,
+        audioExt: isM4aAudioFormat(aMatch) ? 'm4a' : 'webm',
+        thumbnailUrl,
+        filename: sanitizeFilename(title, 'mp4'),
+        mimeType: 'video/mp4',
+        ext: 'mp4',
+        width: vMatch.width,
+        height: vMatch.height,
+        durationSeconds: validDuration,
+        estimatedBytes: totalEst,
+        exceedsLimit: typeof totalEst === 'number' && totalEst > options.maxLimitBytes,
+        limitBytes: options.maxLimitBytes,
+        strategy: 'ffmpeg_mux_dash',
+        headers: options.streamHeaders,
+        resolutionLabel: vMatch.height ? `${vMatch.height}p` : undefined,
+      });
+    }
+  } else if (chosenProg?.url) {
+    const est = parseContentLength(chosenProg.contentLength);
+    videoStreamUrlForAudio = chosenProg.url;
+    assets.push({
+      id: randomUUID(),
+      kind: 'video',
+      title,
+      author,
+      platform: options.platform,
+      sourceUrl: options.sourceUrl,
+      streamUrl: chosenProg.url,
+      thumbnailUrl,
+      filename: sanitizeFilename(title, 'mp4'),
+      mimeType: 'video/mp4',
+      ext: 'mp4',
+      width: chosenProg.width,
+      height: chosenProg.height,
+      durationSeconds: validDuration,
+      estimatedBytes: est,
+      exceedsLimit: typeof est === 'number' && est > options.maxLimitBytes,
+      limitBytes: options.maxLimitBytes,
+      strategy: 'direct_http',
+      headers: options.streamHeaders,
+      resolutionLabel: chosenProg.height ? `${chosenProg.height}p` : undefined,
+    });
+  }
+
+  // Extract MP3 audio from the video stream (or audio stream fallback) via FFmpeg
+  const audioExtractSource = videoStreamUrlForAudio ?? audioOnly[0]?.url;
+  if (audioExtractSource) {
+    assets.push({
+      id: randomUUID(),
+      kind: 'audio',
+      title: `${title} (Audio)`,
+      author,
+      platform: options.platform,
+      sourceUrl: options.sourceUrl,
+      streamUrl: audioExtractSource,
+      thumbnailUrl,
+      filename: sanitizeFilename(`${title}_audio`, 'mp3'),
+      mimeType: 'audio/mpeg',
+      ext: 'mp3',
+      durationSeconds: validDuration,
+      exceedsLimit: false,
+      limitBytes: options.maxLimitBytes,
+      strategy: 'ffmpeg_extract_mp3',
+      headers: options.streamHeaders,
+    });
+  }
+
+  return { title, author, assets };
+}
+
+async function fetchInnerTubePlayer(
+  videoId: string,
+  profile: InnerTubeClientProfile,
+  cookiesHeader?: string
+): Promise<InnerTubePlayerResponse> {
+  const endpoint =
+    profile.name === 'TVHTML5_SIMPLY_EMBEDDED_PLAYER'
+      ? 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
+      : 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+
+  const body: Record<string, unknown> = {
+    videoId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+    context: {
+      client: profile.contextClient,
+      ...(profile.name === 'TVHTML5_SIMPLY_EMBEDDED_PLAYER'
+        ? {
+            thirdParty: {
+              embedUrl: `https://www.youtube.com/watch?v=${videoId}`,
+            },
+          }
+        : {}),
+    },
+  };
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'User-Agent': profile.userAgent,
+    'X-YouTube-Client-Name': profile.clientNameHeader,
+    'X-YouTube-Client-Version': profile.clientVersion,
+    Origin: 'https://www.youtube.com',
+  };
+  if (cookiesHeader?.trim()) {
+    headers.Cookie = cookiesHeader.trim();
+  }
+
+  const res = await undiciFetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10_000),
+    dispatcher: youtubeHttpAgent,
+  });
+
+  if (!res.ok) {
+    throw new Error(`InnerTube ${profile.name} returned HTTP ${res.status}`);
+  }
+  return (await res.json()) as InnerTubePlayerResponse;
+}
+
+async function fetchWatchPagePlayerResponse(
+  videoId: string,
+  cookiesHeader?: string
+): Promise<InnerTubePlayerResponse | null> {
+  const headers: Record<string, string> = {
+    'User-Agent': BROWSER_USER_AGENT,
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  if (cookiesHeader?.trim()) {
+    headers.Cookie = cookiesHeader.trim();
+  }
+
+  const res = await undiciFetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers,
+    redirect: 'follow',
+    signal: AbortSignal.timeout(10_000),
+    dispatcher: youtubeHttpAgent,
+  });
+  if (!res.ok) return null;
+  const html = await res.text();
+  const marker = 'var ytInitialPlayerResponse = ';
+  const idx = html.indexOf(marker);
+  if (idx === -1) return null;
+  const jsonStart = idx + marker.length;
+  const endIdx = html.indexOf(';</script>', jsonStart);
+  if (endIdx === -1) return null;
+
+  try {
+    return JSON.parse(html.slice(jsonStart, endIdx)) as InnerTubePlayerResponse;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchYouTubeMusicPlaylistVideoIds(
+  listId: string,
+  cookiesHeader?: string
+): Promise<string[]> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'User-Agent': BROWSER_USER_AGENT,
+    'X-YouTube-Client-Name': '67',
+    'X-YouTube-Client-Version': '1.20241120.01.00',
+    Origin: 'https://music.youtube.com',
+    Referer: 'https://music.youtube.com/',
+  };
+  if (cookiesHeader?.trim()) {
+    headers.Cookie = cookiesHeader.trim();
+  }
+
+  const browseId = listId.startsWith('VL') ? listId : `VL${listId}`;
+  const res = await undiciFetch(
+    'https://music.youtube.com/youtubei/v1/browse?prettyPrint=false',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        browseId,
+        context: {
+          client: {
+            clientName: 'WEB_REMIX',
+            clientVersion: '1.20241120.01.00',
+            hl: 'en',
+            gl: 'US',
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(10_000),
+      dispatcher: youtubeHttpAgent,
+    }
+  );
+  if (!res.ok) {
+    throw new Error(`YouTube Music playlist browse returned HTTP ${res.status}`);
+  }
+  const text = await res.text();
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const m of text.matchAll(/"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"/g)) {
+    if (!seen.has(m[1])) {
+      seen.add(m[1]);
+      ids.push(m[1]);
+      if (ids.length >= 20) break;
+    }
+  }
+  return ids;
+}
+
+async function resolveSingleYouTubeVideo(
+  videoId: string,
+  parsedUrl: ParsedMediaUrl,
+  options: ExtractionOptions
+): Promise<{
+  title: string;
+  author?: string;
+  assets: MediaAsset[];
+  extractorUsed: string;
+}> {
+  const maxLimitBytes = options.maxLimitBytes ?? DEFAULT_LIMIT_BYTES;
+  const quality = options.youtubeQuality ?? '720';
+  const errors: string[] = [];
+
+  for (const profile of INNERTUBE_CLIENTS) {
+    try {
+      const player = await fetchInnerTubePlayer(
+        videoId,
+        profile,
+        options.cookiesHeader
+      );
+      const status = player.playabilityStatus?.status;
+      if (status && status !== 'OK') {
+        errors.push(
+          `${profile.name}: ${status} (${player.playabilityStatus?.reason ?? 'unplayable'})`
+        );
+        continue;
+      }
+
+      const streamHeaders: Record<string, string> = {
+        'User-Agent': profile.userAgent,
+        ...(options.cookiesHeader?.trim()
+          ? { Cookie: options.cookiesHeader.trim() }
+          : {}),
+      };
+      const built = buildAssetsFromInnerTubePlayer(player, {
+        platform: parsedUrl.platform,
+        sourceUrl: parsedUrl.normalizedUrl,
+        quality,
+        maxLimitBytes,
+        streamHeaders,
+      });
+
+      if (built.assets.length > 0) {
+        return {
+          ...built,
+          extractorUsed: `innertube-${profile.name.toLowerCase()}`,
+        };
+      }
+      errors.push(`${profile.name}: no direct stream URLs`);
+    } catch (err) {
+      errors.push(`${profile.name}: ${(err as Error).message}`);
+    }
+  }
+
+  // Fallback to watch page ytInitialPlayerResponse
+  try {
+    const watchPlayer = await fetchWatchPagePlayerResponse(
+      videoId,
+      options.cookiesHeader
+    );
+    if (watchPlayer?.streamingData) {
+      const built = buildAssetsFromInnerTubePlayer(watchPlayer, {
+        platform: parsedUrl.platform,
+        sourceUrl: parsedUrl.normalizedUrl,
+        quality,
+        maxLimitBytes,
+        streamHeaders: {
+          'User-Agent': BROWSER_USER_AGENT,
+          Referer: 'https://www.youtube.com/',
+        },
+      });
+      if (built.assets.length > 0) {
+        return {
+          ...built,
+          extractorUsed: 'youtube-watch-html',
+        };
+      }
+    }
+  } catch (err) {
+    errors.push(`watch-html: ${(err as Error).message}`);
+  }
+
+  throw new Error(
+    `Direct YouTube extraction failed: ${errors.join(' | ') || 'no playable streams found'}`
+  );
+}
+
+export async function extractYouTubeDirect(
+  parsedUrl: ParsedMediaUrl,
+  options: ExtractionOptions = {}
+): Promise<ExtractionResult> {
+  const start = Date.now();
+  const videoId = extractYouTubeVideoId(parsedUrl.normalizedUrl);
+
+  if (videoId) {
+    const resolved = await resolveSingleYouTubeVideo(videoId, parsedUrl, options);
+    return {
+      platform: parsedUrl.platform,
+      sourceUrl: parsedUrl.normalizedUrl,
+      title: resolved.title,
+      author: resolved.author,
+      extractorUsed: resolved.extractorUsed,
+      extractionMs: Date.now() - start,
+      isCarousel: resolved.assets.filter((a) => a.kind !== 'audio').length > 1,
+      hasSeparateAudio: resolved.assets.some((a) => a.kind === 'audio'),
+      assets: resolved.assets,
+      warnings: [],
+    };
+  }
+
+  if (parsedUrl.platform === 'youtube_music') {
+    const listId = extractYouTubePlaylistId(parsedUrl.normalizedUrl);
+    if (listId) {
+      const videoIds = await fetchYouTubeMusicPlaylistVideoIds(
+        listId,
+        options.cookiesHeader
+      );
+      if (videoIds.length === 0) {
+        throw new Error('No tracks found in YouTube Music playlist.');
+      }
+      const trackResults = await Promise.allSettled(
+        videoIds.map((id) =>
+          resolveSingleYouTubeVideo(
+            id,
+            {
+              ...parsedUrl,
+              normalizedUrl: `https://music.youtube.com/watch?v=${id}`,
+            },
+            options
+          )
+        )
+      );
+      const assets: MediaAsset[] = [];
+      for (const res of trackResults) {
+        if (res.status === 'fulfilled') {
+          assets.push(...res.value.assets);
+        }
+      }
+      if (assets.length === 0) {
+        throw new Error('Could not resolve playable streams for playlist tracks.');
+      }
+      return {
+        platform: 'youtube_music',
+        sourceUrl: parsedUrl.normalizedUrl,
+        title: `YouTube Music Playlist (${assets.length} tracks)`,
+        extractorUsed: 'innertube-playlist',
+        extractionMs: Date.now() - start,
+        isCarousel: false,
+        hasSeparateAudio: true,
+        assets,
+        warnings: [],
+      };
+    }
+  }
+
+  throw new Error('Could not extract YouTube video ID from URL.');
+}

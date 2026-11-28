@@ -159,11 +159,24 @@ export async function splitVideoStreamForAudio(
   };
 }
 
+function isYouTubePlatform(platform: MediaAsset['platform']): boolean {
+  return (
+    platform === 'youtube' ||
+    platform === 'youtube_shorts' ||
+    platform === 'youtube_music'
+  );
+}
+
 async function openYtDlpFallback(
   asset: MediaAsset,
   mode: 'audio' | 'video',
   onComplete?: (totalBytes: number, durationMs: number) => void
 ): Promise<OpenedZeroDiskStream> {
+  if (isYouTubePlatform(asset.platform)) {
+    throw new Error(
+      `Direct stream failed for ${asset.platform}; yt-dlp fallback is disabled for YouTube.`
+    );
+  }
   const { ensureYtDlpBinary, isTermuxEnvironment } = await import('./extractor.ts');
   const ytDlpBin = await ensureYtDlpBinary();
   const formatSelector = mode === 'audio' ? 'bestaudio/best' : 'best[ext=mp4]/best';
@@ -349,7 +362,9 @@ export async function openZeroDiskStream(
 
   if (!upstreamRes.ok || !upstreamRes.body) {
     // Fallback for signed CDN URLs that reject direct HTTP fetch: stream yt-dlp stdout directly
+    // (disabled for YouTube family, which uses direct InnerTube streams)
     if (
+      !isYouTubePlatform(asset.platform) &&
       (asset.kind === 'video' || asset.kind === 'audio' || shouldExtractMp3) &&
       !shouldCompress &&
       asset.sourceUrl

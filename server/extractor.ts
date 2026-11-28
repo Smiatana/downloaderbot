@@ -15,6 +15,7 @@ import type {
   PlatformId,
   YouTubeQuality,
 } from './types.ts';
+import { extractYouTubeDirect } from './youtubeDirect.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -2035,6 +2036,16 @@ async function runExtractionPipeline(
 ): Promise<ExtractionResult> {
   const maxLimitBytes = options.maxLimitBytes ?? DEFAULT_LIMIT_BYTES;
   const errors: string[] = [];
+
+  // YouTube / YouTube Shorts / YouTube Music: use pure-JS InnerTube direct extraction
+  // (never spawn yt-dlp for YouTube, as ARM/Termux yt-dlp builds fail with 403/outdated JS runtimes)
+  if (
+    parsedUrl.platform === 'youtube' ||
+    parsedUrl.platform === 'youtube_shorts' ||
+    parsedUrl.platform === 'youtube_music'
+  ) {
+    return await extractYouTubeDirect(parsedUrl, options);
+  }
 
   // For TikTok, TikWM resolves watermark-free HD MP4, photo slideshows, and MP3 in <1s.
   // If TikWM rate-limits or fails, try fast direct HTML rehydration before spawning yt-dlp.
