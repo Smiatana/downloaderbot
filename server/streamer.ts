@@ -266,8 +266,9 @@ export async function openZeroDiskStream(
 
   // Strategy 1: Zero-disk DASH video+audio muxing via undiciFetch -> FFmpeg pipe:3 + pipe:4 -> pipe:1
   if (shouldMuxDash && asset.audioStreamUrl) {
-    const fetchHeaders = {
+    const fetchHeaders: Record<string, string> = {
       'User-Agent': DEFAULT_USER_AGENT,
+      ...(isYouTubePlatform(asset.platform) ? { Range: 'bytes=0-' } : {}),
       ...asset.headers,
     };
     const [videoRes, audioRes] = await Promise.all([
@@ -393,6 +394,7 @@ export async function openZeroDiskStream(
   const upstreamRes = await undiciFetch(asset.streamUrl, {
     headers: {
       'User-Agent': DEFAULT_USER_AGENT,
+      ...(isYouTubePlatform(asset.platform) ? { Range: 'bytes=0-' } : {}),
       ...asset.headers,
     },
     redirect: 'follow',

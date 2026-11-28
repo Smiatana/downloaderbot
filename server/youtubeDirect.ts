@@ -624,8 +624,8 @@ async function probePlayableStream(
     const res = await undiciFetch(url, {
       method: 'GET',
       headers: {
+        Range: 'bytes=0-',
         ...headers,
-        Range: 'bytes=0-1023',
       },
       redirect: 'follow',
       signal: AbortSignal.timeout(5_000),
