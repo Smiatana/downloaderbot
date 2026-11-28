@@ -700,13 +700,24 @@ async function resolveSingleYouTubeVideo(
       });
 
       if (built.assets.length > 0) {
+        const primaryAsset = built.assets[0];
         const probe = await probePlayableStream(
-          built.assets[0].streamUrl,
+          primaryAsset.streamUrl,
           streamHeaders
         );
         if (!probe.ok) {
           errors.push(`${profile.name}: stream rejected (${probe.reason})`);
           continue;
+        }
+        if (primaryAsset.audioStreamUrl) {
+          const audioProbe = await probePlayableStream(
+            primaryAsset.audioStreamUrl,
+            streamHeaders
+          );
+          if (!audioProbe.ok) {
+            errors.push(`${profile.name}: audio stream rejected (${audioProbe.reason})`);
+            continue;
+          }
         }
         return {
           ...built,

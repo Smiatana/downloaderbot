@@ -242,19 +242,6 @@ async function openYtDlpFallback(
   };
 }
 
-function buildFfmpegHeadersArg(headers?: Record<string, string>): string {
-  const merged: Record<string, string> = {
-    'User-Agent': DEFAULT_USER_AGENT,
-    ...headers,
-  };
-  return (
-    Object.entries(merged)
-      .filter(([k]) => k.toLowerCase() !== 'host')
-      .map(([k, v]) => `${k}: ${v.replace(/[\r\n]/g, '')}`)
-      .join('\r\n') + '\r\n'
-  );
-}
-
 export async function openZeroDiskStream(
   asset: MediaAsset,
   options: {
@@ -277,9 +264,43 @@ export async function openZeroDiskStream(
     asset.exceedsLimit &&
     asset.kind === 'video';
 
-  // Strategy 1: Zero-disk DASH video+audio muxing via FFmpeg pipe:1
+  // Strategy 1: Zero-disk DASH video+audio muxing via undiciFetch -> FFmpeg pipe:3 + pipe:4 -> pipe:1
   if (shouldMuxDash && asset.audioStreamUrl) {
-    const headerBlock = buildFfmpegHeadersArg(asset.headers);
+    const fetchHeaders = {
+      'User-Agent': DEFAULT_USER_AGENT,
+      ...asset.headers,
+    };
+    const [videoRes, audioRes] = await Promise.all([
+      undiciFetch(asset.streamUrl, {
+        headers: fetchHeaders,
+        redirect: 'follow',
+        dispatcher: streamHttpAgent,
+      }),
+      undiciFetch(asset.audioStreamUrl, {
+        headers: fetchHeaders,
+        redirect: 'follow',
+        dispatcher: streamHttpAgent,
+      }),
+    ]);
+
+    if (!videoRes.ok || !videoRes.body) {
+      await videoRes.body?.cancel().catch(() => {});
+      await audioRes.body?.cancel().catch(() => {});
+      throw new Error(`DASH video stream returned HTTP ${videoRes.status}`);
+    }
+    if (!audioRes.ok || !audioRes.body) {
+      await videoRes.body.cancel().catch(() => {});
+      await audioRes.body?.cancel().catch(() => {});
+      throw new Error(`DASH audio stream returned HTTP ${audioRes.status}`);
+    }
+
+    const videoReadable = Readable.fromWeb(
+      videoRes.body as unknown as WebReadableStream
+    );
+    const audioReadable = Readable.fromWeb(
+      audioRes.body as unknown as WebReadableStream
+    );
+
     const isAudioAacCompatible =
       asset.audioExt === 'm4a' ||
       asset.audioExt === 'mp4' ||
@@ -287,14 +308,10 @@ export async function openZeroDiskStream(
     const ffmpegArgs = [
       '-loglevel',
       'error',
-      '-headers',
-      headerBlock,
       '-i',
-      asset.streamUrl,
-      '-headers',
-      headerBlock,
+      'pipe:3',
       '-i',
-      asset.audioStreamUrl,
+      'pipe:4',
       '-c:v',
       'copy',
       ...(isAudioAacCompatible ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '128k']),
@@ -307,28 +324,52 @@ export async function openZeroDiskStream(
 
     const proc = spawn('ffmpeg', ffmpegArgs, {
       shell: false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+    });
+
+    const stdout = proc.stdout as Readable;
+    const stderr = proc.stderr as Readable;
+    const videoPipe = proc.stdio[3] as NodeJS.WritableStream;
+    const audioPipe = proc.stdio[4] as NodeJS.WritableStream;
+    videoPipe.on('error', () => {});
+    audioPipe.on('error', () => {});
+
+    videoReadable.pipe(videoPipe);
+    audioReadable.pipe(audioPipe);
+    videoReadable.on('error', (err) => {
+      if (!proc.killed) proc.kill('SIGKILL');
+      stdout.destroy(err);
+    });
+    audioReadable.on('error', (err) => {
+      if (!proc.killed) proc.kill('SIGKILL');
+      stdout.destroy(err);
     });
 
     let stderrMsg = '';
-    proc.stderr.on('data', (d: Buffer) => {
+    stderr.on('data', (d: Buffer) => {
       stderrMsg = appendStderr(stderrMsg, d);
     });
-    proc.on('error', (err) => proc.stdout.destroy(err));
+    proc.on('error', (err) => stdout.destroy(err));
     proc.on('close', (code) => {
-      if (code && code !== 0 && !proc.stdout.destroyed) {
-        proc.stdout.destroy(
+      if (code && code !== 0 && !stdout.destroyed) {
+        stdout.destroy(
           new Error(`FFmpeg DASH mux exited with ${code}: ${stderrMsg.slice(0, 200)}`)
         );
       }
     });
 
-    const metered = attachByteMeter(proc.stdout, options.onComplete);
+    const cleanupDash = () => {
+      videoReadable.destroy();
+      audioReadable.destroy();
+      if (!proc.killed) proc.kill('SIGKILL');
+    };
+
+    const metered = attachByteMeter(stdout, options.onComplete);
     try {
       await assertReadableHasData(metered, 15_000);
     } catch (err) {
       metered.destroy();
-      if (!proc.killed) proc.kill('SIGKILL');
+      cleanupDash();
       if (!isYouTubePlatform(asset.platform) && asset.sourceUrl && !shouldCompress) {
         return openYtDlpFallback(asset, 'video', options.onComplete);
       }
@@ -344,9 +385,7 @@ export async function openZeroDiskStream(
       stream: metered,
       contentType: 'video/mp4',
       filename: asset.filename.replace(/\.[^.]+$/, '.mp4'),
-      cleanup: () => {
-        if (!proc.killed) proc.kill('SIGKILL');
-      },
+      cleanup: cleanupDash,
     };
   }
 
